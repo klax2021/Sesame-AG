@@ -23,6 +23,15 @@ import io.github.aoguai.sesameag.model.modelFieldExt.StringModelField
 import io.github.aoguai.sesameag.task.AnswerAI.AnswerAI
 import io.github.aoguai.sesameag.task.ModelTask
 import io.github.aoguai.sesameag.task.TaskCommon
+import io.github.aoguai.sesameag.task.common.TaskFlowAction
+import io.github.aoguai.sesameag.task.common.TaskFlowActionResult
+import io.github.aoguai.sesameag.task.common.TaskFlowAdapter
+import io.github.aoguai.sesameag.task.common.TaskFlowDecision
+import io.github.aoguai.sesameag.task.common.TaskFlowEngine
+import io.github.aoguai.sesameag.task.common.TaskFlowItem
+import io.github.aoguai.sesameag.task.common.TaskFlowPhase
+import io.github.aoguai.sesameag.task.common.TaskFlowSnapshot
+import io.github.aoguai.sesameag.task.common.TaskRpcFailureType
 import io.github.aoguai.sesameag.task.exchange.ExchangeCost
 import io.github.aoguai.sesameag.task.exchange.ExchangeItem
 import io.github.aoguai.sesameag.task.exchange.ExchangeLimit
@@ -137,21 +146,6 @@ class AntSports : ModelTask() {
         val candidates: LinkedHashMap<String, SportsHomeRewardCandidate> = LinkedHashMap(),
         var missingRecordIdCount: Int = 0
     )
-
-    private data class SportsPanelTaskSnapshot(
-        val totalTasks: Int,
-        val completedTasks: Int,
-        val availableTasks: Int
-    )
-
-    private data class SportsPanelRoundAction(
-        val action: String,
-        val taskName: String = ""
-    ) {
-        fun describe(): String {
-            return if (taskName.isBlank()) action else "$action：$taskName"
-        }
-    }
 
     private data class MotionQuizRewardCandidate(
         val creativityId: String,
@@ -272,21 +266,6 @@ class AntSports : ModelTask() {
         COMPLETED,
         NO_STEPS,
         STOP
-    }
-
-    private enum class SportsPanelTaskCompleteResult {
-        SUCCESS,
-        FAILED,
-        STOP_CURRENT_ROUND
-    }
-
-    private enum class SportsRpcFailureType {
-        TERMINAL_DONE,
-        BUSINESS_LIMIT,
-        UNSUPPORTED_NO_CLOSURE,
-        NON_RETRYABLE_INVALID,
-        RETRYABLE_RPC,
-        UNKNOWN_NEEDS_REVIEW
     }
 
     /** @brief 临时步数缓存（-1 表示未初始化） */
@@ -1341,124 +1320,138 @@ class AntSports : ModelTask() {
 
     private fun sportsTaskPanel() {
         sportsCheckIn()
-            val failedCompleteTaskIds = mutableSetOf<String>()
-            val failedReceiveTaskIds = mutableSetOf<String>()
-            var round = 1
-            var roundLimit = 1
+        TaskFlowEngine(SportsPanelTaskFlowAdapter()).run()
+    }
 
-            while (round <= roundLimit) {
-                val jo = JSONObject(AntSportsRpcCall.queryCoinTaskPanel())
-                if (!ResChecker.checkRes(TAG, jo)) {
-                    return
-                }
+    private inner class SportsPanelTaskFlowAdapter : TaskFlowAdapter {
+        override val moduleName: String = SPORTS_TASK_BLACKLIST_MODULE
+        override val flowName: String = "运动任务面板"
 
-                val data = jo.optJSONObject("data") ?: return
-                val taskList = data.optJSONArray("taskList") ?: return
-                if (round == 1) {
-                    roundLimit = estimateSportsPanelTaskRoundLimit(taskList)
-                }
+        override fun query(): JSONObject {
+            return JSONObject(AntSportsRpcCall.queryCoinTaskPanel())
+        }
 
-                val taskSnapshot = buildSportsPanelTaskSnapshot(taskList)
-                var progressed = false
-                var stopCurrentRound = false
-                var shouldRequeryImmediately = false
-                var roundAction = SportsPanelRoundAction("无可执行动作")
+        override fun isQuerySuccess(response: JSONObject): Boolean {
+            return ResChecker.checkRes(TAG, response)
+        }
 
-                taskLoop@ for (i in 0 until taskList.length()) {
-                    val taskDetail = taskList.optJSONObject(i) ?: continue
-                    val taskId = taskDetail.optString("taskId", "")
-                    val taskName = taskDetail.optString("taskName", taskId)
-                    val taskStatus = taskDetail.optString("taskStatus", "")
-                    val taskType = taskDetail.optString("taskType", "")
-
-                    if (taskType == "SETTLEMENT") continue
-
-                    val isBlacklisted =
-                        TaskBlacklist.isTaskInBlacklist(SPORTS_TASK_BLACKLIST_MODULE, taskId) ||
-                            TaskBlacklist.isTaskInBlacklist(SPORTS_TASK_BLACKLIST_MODULE, taskName)
-                    if (isBlacklisted && taskStatus != "WAIT_RECEIVE") {
-                        continue
-                    }
-
-                    when (taskStatus) {
-                        "HAS_RECEIVED" -> Unit
-                        "WAIT_RECEIVE" -> {
-                            val receiveKey = buildSportsPanelReceiveKey(taskDetail, taskId)
-                            if (receiveKey in failedReceiveTaskIds) {
-                                Log.sports("运动任务面板[本轮已跳过领取失败任务：$taskName]")
-                                roundAction = SportsPanelRoundAction("跳过已失败领取", taskName)
-                                continue@taskLoop
-                            }
-                            if (receiveTaskReward(taskDetail, taskName)) {
-                                progressed = true
-                                shouldRequeryImmediately = true
-                                roundAction = SportsPanelRoundAction("领取奖励后刷新", taskName)
-                            } else {
-                                failedReceiveTaskIds.add(receiveKey)
-                                roundAction = SportsPanelRoundAction("领取失败", taskName)
-                            }
-                        }
-                        "WAIT_COMPLETE" -> {
-                            val completeKey = buildSportsPanelCompleteKey(taskDetail, taskId)
-                            if (completeKey in failedCompleteTaskIds) {
-                                Log.sports("运动任务面板[本轮已跳过完成失败任务：$taskName]")
-                                roundAction = SportsPanelRoundAction("跳过已失败完成", taskName)
-                                continue@taskLoop
-                            }
-                            when (completeTask(taskDetail, taskName)) {
-                                SportsPanelTaskCompleteResult.SUCCESS -> {
-                                    progressed = true
-                                    shouldRequeryImmediately = true
-                                    roundAction = SportsPanelRoundAction("完成任务后刷新", taskName)
-                                }
-
-                                SportsPanelTaskCompleteResult.FAILED -> {
-                                    failedCompleteTaskIds.add(completeKey)
-                                    roundAction = SportsPanelRoundAction("完成失败", taskName)
-                                }
-
-                                SportsPanelTaskCompleteResult.STOP_CURRENT_ROUND -> {
-                                    failedCompleteTaskIds.add(completeKey)
-                                    if (!stopCurrentRound) {
-                                        Log.sports("运动任务面板[本轮止损：检测到离线/验证类错误，停止继续执行剩余浏览任务]")
-                                    }
-                                    stopCurrentRound = true
-                                    roundAction = SportsPanelRoundAction("止损停止", taskName)
-                                }
-                            }
-                        }
-                        else -> {
-                            Log.error(TAG, "做任务得能量🎈[未知状态：$taskName，状态：$taskStatus]")
-                            roundAction = SportsPanelRoundAction("未知状态", taskName)
-                        }
-                    }
-
-                    if (shouldRequeryImmediately || stopCurrentRound) {
-                        break
-                    }
-                }
-
-                Log.sports(
-                    "运动任务面板刷新进度[轮次:$round/$roundLimit][处理前已领取:${taskSnapshot.completedTasks}/${taskSnapshot.totalTasks}][处理前待处理:${taskSnapshot.availableTasks}][本轮动作:${roundAction.describe()}][本轮有进展:$progressed]"
+        override fun extractItems(response: JSONObject): List<TaskFlowItem> {
+            val taskList = response.optJSONObject("data")?.optJSONArray("taskList") ?: return emptyList()
+            val items = mutableListOf<TaskFlowItem>()
+            for (i in 0 until taskList.length()) {
+                val taskDetail = taskList.optJSONObject(i) ?: continue
+                val taskId = taskDetail.optString("taskId", "").trim()
+                val taskName = taskDetail.optString("taskName", taskId).trim()
+                val currentNum = taskDetail.optInt("currentNum", 0)
+                val limitConfigNum = taskDetail.optInt("limitConfigNum", currentNum + 1)
+                items.add(
+                    TaskFlowItem(
+                        id = taskId,
+                        title = taskName.ifBlank { taskId },
+                        status = taskDetail.optString("taskStatus", ""),
+                        type = taskDetail.optString("taskType", ""),
+                        sceneCode = taskDetail.optString("sceneCode", ""),
+                        actionType = taskDetail.optString("taskAction", ""),
+                        blacklistKeys = listOf(taskId, taskName).filter { it.isNotBlank() },
+                        raw = taskDetail,
+                        progress = "$currentNum/$limitConfigNum",
+                        current = currentNum,
+                        limit = limitConfigNum
+                    )
                 )
-
-                if (taskSnapshot.totalTasks > 0 && taskSnapshot.completedTasks >= taskSnapshot.totalTasks && taskSnapshot.availableTasks == 0) {
-                    val today = TimeUtil.getDateStr2()
-                    DataStore.put(SPORTS_TASKS_COMPLETED_DATE, today)
-                    Status.setFlagToday(StatusFlags.FLAG_ANTSPORTS_DAILY_TASKS_DONE)
-                    Log.sports("✅ 所有运动任务已完成，今日不再执行")
-                    return
-                }
-
-                if (stopCurrentRound || !progressed) {
-                    return
-                }
-
-                GlobalThreadPools.sleepCompat(1000)
-                round++
             }
+            return items
+        }
 
-            Log.error(TAG, "运动任务面板[达到动态轮次上限$roundLimit，停止以避免重复循环]")
+        override fun mapPhase(item: TaskFlowItem): TaskFlowPhase {
+            return when (item.status) {
+                "HAS_RECEIVED" -> TaskFlowPhase.TERMINAL
+                "WAIT_RECEIVE" -> TaskFlowPhase.REWARD_READY
+                "WAIT_COMPLETE" -> TaskFlowPhase.READY_TO_COMPLETE
+                else -> TaskFlowPhase.UNKNOWN
+            }
+        }
+
+        override fun shouldSkip(item: TaskFlowItem): Boolean {
+            return item.type == "SETTLEMENT"
+        }
+
+        override fun receive(item: TaskFlowItem): TaskFlowActionResult {
+            val taskDetail = item.raw ?: return missingRawResult(item, "receive")
+            return receiveTaskReward(taskDetail, item.title)
+        }
+
+        override fun complete(item: TaskFlowItem): TaskFlowActionResult {
+            val taskDetail = item.raw ?: return missingRawResult(item, "complete")
+            return completeTask(taskDetail, item.title)
+        }
+
+        override fun estimateRoundLimit(items: List<TaskFlowItem>): Int {
+            var visibleTaskCount = 0
+            var pendingTransitions = 0
+            for (item in items) {
+                if (shouldSkip(item)) continue
+                visibleTaskCount++
+                when (item.status) {
+                    "WAIT_RECEIVE" -> pendingTransitions += 1
+                    "WAIT_COMPLETE" -> {
+                        val currentNum = item.current ?: 0
+                        val limitConfigNum = item.limit ?: (currentNum + 1)
+                        val remainingNum = max(1, limitConfigNum - currentNum)
+                        pendingTransitions += remainingNum * 2
+                    }
+                }
+            }
+            return max(1, pendingTransitions + visibleTaskCount)
+        }
+
+        override fun actionKey(item: TaskFlowItem, action: TaskFlowAction): String {
+            val taskDetail = item.raw ?: return super<TaskFlowAdapter>.actionKey(item, action)
+            return when (action) {
+                TaskFlowAction.RECEIVE -> "receive:${buildSportsPanelReceiveKey(taskDetail, item.id)}"
+                TaskFlowAction.COMPLETE -> "complete:${buildSportsPanelCompleteKey(taskDetail, item.id)}"
+                else -> super<TaskFlowAdapter>.actionKey(item, action)
+            }
+        }
+
+        override fun onAllTasksDone(snapshot: TaskFlowSnapshot) {
+            val today = TimeUtil.getDateStr2()
+            DataStore.put(SPORTS_TASKS_COMPLETED_DATE, today)
+            Status.setFlagToday(StatusFlags.FLAG_ANTSPORTS_DAILY_TASKS_DONE)
+            Log.sports("✅ 所有运动任务已完成，今日不再执行")
+        }
+
+        override fun onQueryFailed(response: JSONObject) {
+            Log.error(TAG, "运动任务面板查询失败 raw=$response")
+        }
+
+        override fun afterFailure(
+            item: TaskFlowItem,
+            action: TaskFlowAction,
+            result: TaskFlowActionResult,
+            decision: TaskFlowDecision
+        ) {
+            if (result.stopCurrentRound) {
+                Log.sports("运动任务面板[本轮止损：检测到离线/验证类错误，停止继续执行剩余浏览任务]")
+            }
+        }
+
+        override fun logInfo(message: String) {
+            Log.sports(message)
+        }
+
+        override fun logError(message: String) {
+            Log.error(TAG, message)
+        }
+
+        private fun missingRawResult(item: TaskFlowItem, action: String): TaskFlowActionResult {
+            return TaskFlowActionResult.failure(
+                failureType = TaskRpcFailureType.UNKNOWN_NEEDS_REVIEW,
+                message = "缺少任务原始数据",
+                rpc = "SportsPanelTaskFlowAdapter.$action",
+                detail = "taskId=${item.id} taskName=${item.title} status=${item.status}"
+            )
+        }
     }
 
     private fun motionDailyQuiz() {
@@ -1771,55 +1764,6 @@ class AntSports : ModelTask() {
         return null
     }
 
-    private fun buildSportsPanelTaskSnapshot(taskList: JSONArray): SportsPanelTaskSnapshot {
-        var totalTasks = 0
-        var completedTasks = 0
-        var availableTasks = 0
-        for (i in 0 until taskList.length()) {
-            val taskDetail = taskList.optJSONObject(i) ?: continue
-            val taskType = taskDetail.optString("taskType", "")
-            if (taskType == "SETTLEMENT") continue
-
-            val taskId = taskDetail.optString("taskId", "")
-            val taskName = taskDetail.optString("taskName", taskId)
-            val taskStatus = taskDetail.optString("taskStatus", "")
-            val isBlacklisted =
-                TaskBlacklist.isTaskInBlacklist(SPORTS_TASK_BLACKLIST_MODULE, taskId) ||
-                    TaskBlacklist.isTaskInBlacklist(SPORTS_TASK_BLACKLIST_MODULE, taskName)
-            if (isBlacklisted && taskStatus != "WAIT_RECEIVE") {
-                continue
-            }
-
-            totalTasks++
-            when (taskStatus) {
-                "HAS_RECEIVED" -> completedTasks++
-                "WAIT_RECEIVE", "WAIT_COMPLETE" -> availableTasks++
-            }
-        }
-        return SportsPanelTaskSnapshot(totalTasks, completedTasks, availableTasks)
-    }
-
-    private fun estimateSportsPanelTaskRoundLimit(taskList: JSONArray): Int {
-        var visibleTaskCount = 0
-        var pendingTransitions = 0
-        for (i in 0 until taskList.length()) {
-            val taskDetail = taskList.optJSONObject(i) ?: continue
-            if (taskDetail.optString("taskType", "") == "SETTLEMENT") continue
-            visibleTaskCount++
-
-            when (taskDetail.optString("taskStatus", "")) {
-                "WAIT_RECEIVE" -> pendingTransitions += 1
-                "WAIT_COMPLETE" -> {
-                    val currentNum = taskDetail.optInt("currentNum", 0)
-                    val limitConfigNum = taskDetail.optInt("limitConfigNum", currentNum + 1)
-                    val remainingNum = max(1, limitConfigNum - currentNum)
-                    pendingTransitions += remainingNum * 2
-                }
-            }
-        }
-        return max(1, pendingTransitions + visibleTaskCount)
-    }
-
     private fun buildSportsPanelReceiveKey(taskDetail: JSONObject, taskId: String): String {
         val assetId = taskDetail.optString("assetId", "").trim()
         return "$taskId:${assetId.ifBlank { "NO_ASSET" }}"
@@ -1836,9 +1780,9 @@ class AntSports : ModelTask() {
      *
      * @param taskDetail 任务详情 JSON
      * @param taskName   任务名称
-     * @return 是否视为成功
+     * @return 任务流动作结果
      */
-    private fun receiveTaskReward(taskDetail: JSONObject, taskName: String): Boolean {
+    private fun receiveTaskReward(taskDetail: JSONObject, taskName: String): TaskFlowActionResult {
         return try {
             val assetId = taskDetail.getString("assetId")
             val prizeAmount = taskDetail.getInt("prizeAmount").toString()
@@ -1848,41 +1792,60 @@ class AntSports : ModelTask() {
 
             if (isSportsRpcSuccess(resultData)) {
                 Log.sports("做任务得能量🎈[$taskName] +$prizeAmount 能量")
-                true
+                TaskFlowActionResult.success()
             } else {
                 val errorMsg = extractSportsRpcErrorMessage(resultData)
                 val errorCode = extractSportsRpcErrorCode(resultData)
                 if (errorCode == "RECEIVE_REWARD_REPEATED") {
                     Log.sports("做任务得能量🎈[奖励已领取：$taskName，按完成处理：${errorCode.ifEmpty { "UNKNOWN" }} - $errorMsg}]"
                     )
-                    true
+                    TaskFlowActionResult.failure(
+                        failureType = TaskRpcFailureType.TERMINAL_DONE,
+                        code = errorCode,
+                        message = errorMsg,
+                        rpc = "AntSportsRpcCall.pickBubbleTaskEnergy",
+                        raw = resultData.toString()
+                    )
                 } else if (errorCode == "CAMP_TRIGGER_ERROR") {
-                    Log.error(
-                        TAG,
-                        "做任务得能量🎈[领取失败-业务RPC受限：$taskName，错误：${errorCode.ifEmpty { "UNKNOWN" }} - $errorMsg]"
+                    TaskFlowActionResult.failure(
+                        failureType = TaskRpcFailureType.BUSINESS_LIMIT,
+                        code = errorCode,
+                        message = errorMsg,
+                        rpc = "AntSportsRpcCall.pickBubbleTaskEnergy",
+                        raw = resultData.toString()
                     )
-                    false
                 } else if (!isSportsRpcRetryable(resultData)) {
-                    Log.error(
-                        TAG,
-                        "做任务得能量🎈[领取失败-非重试RPC：$taskName，错误：${errorCode.ifEmpty { "UNKNOWN" }} - $errorMsg]"
+                    TaskFlowActionResult.failure(
+                        failureType = classifySportsTaskFailure(resultData),
+                        code = errorCode,
+                        message = errorMsg,
+                        rpc = "AntSportsRpcCall.pickBubbleTaskEnergy",
+                        raw = resultData.toString()
                     )
-                    false
                 } else {
-                    Log.error(TAG, "做任务得能量🎈[领取失败：$taskName，错误：${errorCode.ifEmpty { "UNKNOWN" }} - $errorMsg]")
-                    false
+                    TaskFlowActionResult.failure(
+                        failureType = TaskRpcFailureType.RETRYABLE_RPC,
+                        code = errorCode,
+                        message = errorMsg,
+                        rpc = "AntSportsRpcCall.pickBubbleTaskEnergy",
+                        raw = resultData.toString()
+                    )
                 }
             }
         } catch (e: Exception) {
-            Log.error(TAG, "做任务得能量🎈[领取异常：$taskName，错误：${e.message}]")
-            false
+            TaskFlowActionResult.failure(
+                failureType = TaskRpcFailureType.UNKNOWN_NEEDS_REVIEW,
+                message = e.message.orEmpty(),
+                rpc = "AntSportsRpcCall.pickBubbleTaskEnergy",
+                detail = "taskName=$taskName"
+            )
         }
     }
 
     /**
      * @brief 推进一次任务完成状态
      */
-    private fun completeTask(taskDetail: JSONObject, taskName: String): SportsPanelTaskCompleteResult {
+    private fun completeTask(taskDetail: JSONObject, taskName: String): TaskFlowActionResult {
         return try {
             val taskId = taskDetail.getString("taskId")
             val prizeAmount = taskDetail.getString("prizeAmount")
@@ -1897,13 +1860,18 @@ class AntSports : ModelTask() {
             val adTaskPayloadBizId = adTaskFinishPayload.optString("bizId", "").trim()
 
             if (remainingNum <= 0) {
-                return SportsPanelTaskCompleteResult.SUCCESS
+                return TaskFlowActionResult.success()
             }
 
             // 需要先签到
             if (needSignUp) {
                 if (!signUpForTask(taskId, taskName)) {
-                    return SportsPanelTaskCompleteResult.FAILED
+                    return TaskFlowActionResult.failure(
+                        failureType = TaskRpcFailureType.UNKNOWN_NEEDS_REVIEW,
+                        message = "任务报名失败",
+                        rpc = "AntSportsRpcCall.signUpTask",
+                        detail = "taskId=$taskId taskName=$taskName"
+                    )
                 }
                 GlobalThreadPools.sleepCompat(2000)
             }
@@ -1936,7 +1904,7 @@ class AntSports : ModelTask() {
                 }
                 Log.sports("做任务得能量🎈[完成任务：$taskName，得$prizeAmount💰，方式：$completeSource]$progressText"
                 )
-                SportsPanelTaskCompleteResult.SUCCESS
+                TaskFlowActionResult.success()
             } else {
                 val errorCode = extractSportsRpcErrorCode(result)
                 val errorMsg = extractSportsRpcErrorMessage(result)
@@ -1945,48 +1913,76 @@ class AntSports : ModelTask() {
                     useAdTaskFinishRpc -> "AntSportsRpcCall.finishAdTask"
                     else -> "AntSportsRpcCall.completeExerciseTasks"
                 }
-                val detail = "module=$SPORTS_TASK_BLACKLIST_MODULE taskId=$taskId taskName=$taskName " +
-                    "action=completeTask rpc=$completeSource code=${errorCode.ifEmpty { "UNKNOWN" }} msg=$errorMsg raw=$result"
                 if (shouldTemporarilyStopSportsTask(errorCode, errorMsg)) {
-                    Log.error(
-                        TAG,
-                        "做任务得能量🎈[$taskName] classification=RETRYABLE_RPC decision=RETRY_LATER result=STOP_CURRENT_ROUND $detail$progressText"
+                    return TaskFlowActionResult.failure(
+                        failureType = TaskRpcFailureType.RETRYABLE_RPC,
+                        code = errorCode,
+                        message = errorMsg,
+                        rpc = completeSource,
+                        raw = result.toString(),
+                        detail = "progress=$progressText",
+                        stopCurrentRound = true
                     )
-                    return SportsPanelTaskCompleteResult.STOP_CURRENT_ROUND
                 }
 
                 return when (classifySportsTaskFailure(result)) {
-                    SportsRpcFailureType.TERMINAL_DONE -> {
-                        Log.sports("做任务得能量🎈[$taskName] classification=TERMINAL_DONE decision=MARK_HANDLED $detail$progressText")
-                        SportsPanelTaskCompleteResult.SUCCESS
-                    }
-                    SportsRpcFailureType.BUSINESS_LIMIT -> {
-                        Log.error(TAG, "做任务得能量🎈[$taskName] classification=BUSINESS_LIMIT decision=STOP_TODAY_OR_CURRENT_CHAIN $detail$progressText")
-                        SportsPanelTaskCompleteResult.FAILED
-                    }
-                    SportsRpcFailureType.UNSUPPORTED_NO_CLOSURE -> {
-                        blacklistClassifiedSportsTask(taskId, taskName, errorCode)
-                        Log.error(TAG, "做任务得能量🎈[$taskName] classification=UNSUPPORTED_NO_CLOSURE decision=BLACKLIST reason=未抓到稳定完成RPC $detail$progressText")
-                        SportsPanelTaskCompleteResult.FAILED
-                    }
-                    SportsRpcFailureType.NON_RETRYABLE_INVALID -> {
-                        blacklistClassifiedSportsTask(taskId, taskName, errorCode)
-                        Log.error(TAG, "做任务得能量🎈[$taskName] classification=NON_RETRYABLE_INVALID decision=BLACKLIST $detail$progressText")
-                        SportsPanelTaskCompleteResult.FAILED
-                    }
-                    SportsRpcFailureType.RETRYABLE_RPC -> {
-                        Log.error(TAG, "做任务得能量🎈[$taskName] classification=RETRYABLE_RPC decision=RETRY_LATER $detail$progressText")
-                        SportsPanelTaskCompleteResult.FAILED
-                    }
-                    SportsRpcFailureType.UNKNOWN_NEEDS_REVIEW -> {
-                        Log.error(TAG, "做任务得能量🎈[$taskName] classification=UNKNOWN_NEEDS_REVIEW decision=LOG_ONLY $detail$progressText")
-                        SportsPanelTaskCompleteResult.FAILED
-                    }
+                    TaskRpcFailureType.TERMINAL_DONE -> TaskFlowActionResult.failure(
+                        failureType = TaskRpcFailureType.TERMINAL_DONE,
+                        code = errorCode,
+                        message = errorMsg,
+                        rpc = completeSource,
+                        raw = result.toString(),
+                        detail = "progress=$progressText"
+                    )
+                    TaskRpcFailureType.BUSINESS_LIMIT -> TaskFlowActionResult.failure(
+                        failureType = TaskRpcFailureType.BUSINESS_LIMIT,
+                        code = errorCode,
+                        message = errorMsg,
+                        rpc = completeSource,
+                        raw = result.toString(),
+                        detail = "progress=$progressText"
+                    )
+                    TaskRpcFailureType.UNSUPPORTED_NO_CLOSURE -> TaskFlowActionResult.failure(
+                        failureType = TaskRpcFailureType.UNSUPPORTED_NO_CLOSURE,
+                        code = errorCode,
+                        message = errorMsg,
+                        rpc = completeSource,
+                        raw = result.toString(),
+                        detail = "reason=未抓到稳定完成RPC progress=$progressText"
+                    )
+                    TaskRpcFailureType.NON_RETRYABLE_INVALID -> TaskFlowActionResult.failure(
+                        failureType = TaskRpcFailureType.NON_RETRYABLE_INVALID,
+                        code = errorCode,
+                        message = errorMsg,
+                        rpc = completeSource,
+                        raw = result.toString(),
+                        detail = "progress=$progressText"
+                    )
+                    TaskRpcFailureType.RETRYABLE_RPC -> TaskFlowActionResult.failure(
+                        failureType = TaskRpcFailureType.RETRYABLE_RPC,
+                        code = errorCode,
+                        message = errorMsg,
+                        rpc = completeSource,
+                        raw = result.toString(),
+                        detail = "progress=$progressText"
+                    )
+                    TaskRpcFailureType.UNKNOWN_NEEDS_REVIEW -> TaskFlowActionResult.failure(
+                        failureType = TaskRpcFailureType.UNKNOWN_NEEDS_REVIEW,
+                        code = errorCode,
+                        message = errorMsg,
+                        rpc = completeSource,
+                        raw = result.toString(),
+                        detail = "progress=$progressText"
+                    )
                 }
             }
         } catch (e: Exception) {
-            Log.error(TAG, "做任务得能量🎈[执行异常：$taskName，错误：${e.message}]")
-            SportsPanelTaskCompleteResult.FAILED
+            TaskFlowActionResult.failure(
+                failureType = TaskRpcFailureType.UNKNOWN_NEEDS_REVIEW,
+                message = e.message.orEmpty(),
+                rpc = "AntSportsRpcCall.completeExerciseTasks",
+                detail = "taskName=$taskName"
+            )
         }
     }
 
@@ -2207,33 +2203,33 @@ class AntSports : ModelTask() {
         ).firstOrNull { it.isNotEmpty() } ?: "未知错误"
     }
 
-    private fun classifySportsTaskFailure(result: JSONObject): SportsRpcFailureType {
+    private fun classifySportsTaskFailure(result: JSONObject): TaskRpcFailureType {
         val code = extractSportsRpcErrorCode(result)
         val message = extractSportsRpcErrorMessage(result)
         return when {
             code in setOf("RECEIVE_REWARD_REPEATED", "TASK_ALREADY_FINISHED", "TASK_HAS_FINISHED", "REPEAT_FINISH", "REPEAT_REWARD") ||
                 containsAnySports(message, "已领取", "已经领取", "重复领取", "重复领奖", "重复完成", "已完成", "任务已完结", "任务已结束") ->
-                SportsRpcFailureType.TERMINAL_DONE
+                TaskRpcFailureType.TERMINAL_DONE
 
             code == "CAMP_TRIGGER_ERROR" ||
                 code.contains("LIMIT", ignoreCase = true) ||
                 containsAnySports(message, "上限", "限制", "受限", "不可领取", "资格不足", "兑完", "能量不足", "风控", "风险") ->
-                SportsRpcFailureType.BUSINESS_LIMIT
+                TaskRpcFailureType.BUSINESS_LIMIT
 
             code == "400000040" ||
                 containsAnySports(message, "不支持rpc调用", "不支持RPC完成") ->
-                SportsRpcFailureType.UNSUPPORTED_NO_CLOSURE
+                TaskRpcFailureType.UNSUPPORTED_NO_CLOSURE
 
             code in setOf("20020012", "TASK_ID_INVALID", "ILLEGAL_ARGUMENT", "PROMISE_TEMPLATE_NOT_EXIST") ||
                 containsAnySports(message, "参数错误", "任务ID非法", "模板不存在") ->
-                SportsRpcFailureType.NON_RETRYABLE_INVALID
+                TaskRpcFailureType.NON_RETRYABLE_INVALID
 
             code in setOf("3000", "REMOTE_INVOKE_EXCEPTION", "OP_REPEAT_CHECK", "SYSTEM_BUSY", "NETWORK_ERROR", "1009", "I07", "USER_FREQUENTLY_LOCK") ||
                 containsAnySports(message, "系统出错", "系统繁忙", "稍后", "繁忙", "频繁", "重试", "需要验证", "访问被拒绝") ||
                 isSportsFailureMarkedRetryable(result) ->
-                SportsRpcFailureType.RETRYABLE_RPC
+                TaskRpcFailureType.RETRYABLE_RPC
 
-            else -> SportsRpcFailureType.UNKNOWN_NEEDS_REVIEW
+            else -> TaskRpcFailureType.UNKNOWN_NEEDS_REVIEW
         }
     }
 
@@ -2655,26 +2651,26 @@ class AntSports : ModelTask() {
                         )
                     } else {
                         when (classifySportsTaskFailure(completeRes)) {
-                            SportsRpcFailureType.TERMINAL_DONE -> {
+                            TaskRpcFailureType.TERMINAL_DONE -> {
                                 hasCompletedTask = true
                                 hasPendingRewardBubble = true
                                 Log.sports("运动首页任务[$taskName] classification=TERMINAL_DONE decision=MARK_HANDLED $detail")
                             }
-                            SportsRpcFailureType.BUSINESS_LIMIT -> {
+                            TaskRpcFailureType.BUSINESS_LIMIT -> {
                                 Log.error(TAG, "运动首页任务[$taskName] classification=BUSINESS_LIMIT decision=STOP_TODAY_OR_CURRENT_CHAIN $detail")
                             }
-                            SportsRpcFailureType.UNSUPPORTED_NO_CLOSURE -> {
+                            TaskRpcFailureType.UNSUPPORTED_NO_CLOSURE -> {
                                 blacklistClassifiedSportsTask(taskId, taskName, errorCode)
                                 Log.error(TAG, "运动首页任务[$taskName] classification=UNSUPPORTED_NO_CLOSURE decision=BLACKLIST reason=未抓到稳定完成RPC $detail")
                             }
-                            SportsRpcFailureType.NON_RETRYABLE_INVALID -> {
+                            TaskRpcFailureType.NON_RETRYABLE_INVALID -> {
                                 blacklistClassifiedSportsTask(taskId, taskName, errorCode)
                                 Log.error(TAG, "运动首页任务[$taskName] classification=NON_RETRYABLE_INVALID decision=BLACKLIST $detail")
                             }
-                            SportsRpcFailureType.RETRYABLE_RPC -> {
+                            TaskRpcFailureType.RETRYABLE_RPC -> {
                                 Log.error(TAG, "运动首页任务[$taskName] classification=RETRYABLE_RPC decision=RETRY_LATER $detail")
                             }
-                            SportsRpcFailureType.UNKNOWN_NEEDS_REVIEW -> {
+                            TaskRpcFailureType.UNKNOWN_NEEDS_REVIEW -> {
                                 Log.error(TAG, "运动首页任务[$taskName] classification=UNKNOWN_NEEDS_REVIEW decision=LOG_ONLY $detail")
                             }
                         }

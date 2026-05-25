@@ -39,6 +39,14 @@ import io.github.aoguai.sesameag.model.modelFieldExt.TimeTriggerModelField
 import io.github.aoguai.sesameag.task.ModelTask
 import io.github.aoguai.sesameag.task.TaskCommon
 import io.github.aoguai.sesameag.task.TaskStatus
+import io.github.aoguai.sesameag.task.common.TaskFlowAction
+import io.github.aoguai.sesameag.task.common.TaskFlowActionResult
+import io.github.aoguai.sesameag.task.common.TaskFlowAdapter
+import io.github.aoguai.sesameag.task.common.TaskFlowDecision
+import io.github.aoguai.sesameag.task.common.TaskFlowEngine
+import io.github.aoguai.sesameag.task.common.TaskFlowItem
+import io.github.aoguai.sesameag.task.common.TaskFlowPhase
+import io.github.aoguai.sesameag.task.common.TaskRpcFailureType
 import io.github.aoguai.sesameag.task.antFarm.AntFarmRpcCall
 import io.github.aoguai.sesameag.task.antFarm.FarmGame
 import io.github.aoguai.sesameag.task.antForest.ForestUtil.hasBombCard
@@ -100,15 +108,6 @@ class AntForest : ModelTask(), EnergyCollectCallback {
     private val taskCount = AtomicInteger(0)
     private val isEnergyLoopRunning = AtomicBoolean(false)
     private val forestTaskBlacklistModule = "蚂蚁森林"
-
-    private enum class ForestTaskFailureType {
-        TERMINAL_DONE,
-        BUSINESS_LIMIT,
-        UNSUPPORTED_NO_CLOSURE,
-        NON_RETRYABLE_INVALID,
-        RETRYABLE_RPC,
-        UNKNOWN_NEEDS_REVIEW
-    }
 
     private var selfId: String? = null
 
@@ -3886,54 +3885,6 @@ class AntForest : ModelTask(), EnergyCollectCallback {
         return 39
     }
 
-    /**
-     * 执行当天森林签到任务
-     *
-     * @param forestSignVOList 森林签到列表
-     * @return 获得的能量，如果签到失败或已签到则返回 0
-     */
-    private fun dailyTask(forestSignVOList: JSONArray): Int {
-        try {
-            var totalAwardCount = 0
-            for (signIndex in 0..<forestSignVOList.length()) {
-                val forestSignVO = forestSignVOList.optJSONObject(signIndex) ?: continue
-                val currentSignKey = forestSignVO.optString("currentSignKey") // 当前签到的 key
-                val signId = forestSignVO.optString("signId") // 签到ID
-                val sceneCode = forestSignVO.optString("sceneCode") // 场景代码
-                val signRecords = forestSignVO.optJSONArray("signRecords") ?: continue // 签到记录
-                if (currentSignKey.isEmpty() || signId.isEmpty() || sceneCode.isEmpty()) {
-                    continue
-                }
-                for (i in 0..<signRecords.length()) { //遍历签到记录
-                    val signRecord = signRecords.optJSONObject(i) ?: continue
-                    val signKey = signRecord.optString("signKey")
-                    val awardCount = signRecord.optInt("awardCount", 0)
-                    if (signKey == currentSignKey && !signRecord.optBoolean("signed", true)) {
-                        val joSign = JSONObject(
-                            AntForestRpcCall.antiepSign(
-                                signId,
-                                UserMap.currentUid ?: return totalAwardCount,
-                                sceneCode
-                            )
-                        )
-                        GlobalThreadPools.sleepCompat(300) // 等待300毫秒
-                        if (isForestSignAlreadyHandled(joSign)) {
-                            Log.forest("森林签到已完成，跳过重复签到")
-                        } else if (ResChecker.checkRes(TAG, "森林签到失败:", joSign)) {
-                            Log.forest("森林签到📆成功")
-                            totalAwardCount += awardCount
-                        }
-                        break
-                    }
-                }
-            }
-            return totalAwardCount
-        } catch (e: Exception) {
-            Log.printStackTrace(e)
-            return 0
-        }
-    }
-
     private fun isForestSignAlreadyHandled(response: JSONObject): Boolean {
         val code = response.optString("code")
         val desc = response.optString("desc")
@@ -4103,37 +4054,37 @@ class AntForest : ModelTask(), EnergyCollectCallback {
         val detail = "module=$forestTaskBlacklistModule taskId=$taskType taskType=$taskType taskName=$taskTitle " +
             "sceneCode=$sceneCode action=$action rpc=$rpc code=${code.ifBlank { "UNKNOWN" }} msg=$message raw=$response"
         return when (classifyForestTaskFailure(response)) {
-            ForestTaskFailureType.TERMINAL_DONE -> {
+            TaskRpcFailureType.TERMINAL_DONE -> {
                 tryKey?.let(forestTaskTryCount::remove)
                 Log.forest("森林任务[$taskTitle] classification=TERMINAL_DONE decision=MARK_HANDLED $detail")
                 terminalResult
             }
 
-            ForestTaskFailureType.BUSINESS_LIMIT -> {
+            TaskRpcFailureType.BUSINESS_LIMIT -> {
                 Log.forest("森林任务[$taskTitle] classification=BUSINESS_LIMIT decision=STOP_TODAY_OR_CURRENT_CHAIN $detail")
                 false
             }
 
-            ForestTaskFailureType.UNSUPPORTED_NO_CLOSURE -> {
+            TaskRpcFailureType.UNSUPPORTED_NO_CLOSURE -> {
                 blacklistClassifiedForestTask(taskType, taskTitle, code)
                 tryKey?.let(forestTaskTryCount::remove)
                 Log.error(TAG, "森林任务[$taskTitle] classification=UNSUPPORTED_NO_CLOSURE decision=BLACKLIST reason=未抓到稳定完成RPC $detail")
                 false
             }
 
-            ForestTaskFailureType.NON_RETRYABLE_INVALID -> {
+            TaskRpcFailureType.NON_RETRYABLE_INVALID -> {
                 blacklistClassifiedForestTask(taskType, taskTitle, code)
                 tryKey?.let(forestTaskTryCount::remove)
                 Log.error(TAG, "森林任务[$taskTitle] classification=NON_RETRYABLE_INVALID decision=BLACKLIST $detail")
                 false
             }
 
-            ForestTaskFailureType.RETRYABLE_RPC -> {
+            TaskRpcFailureType.RETRYABLE_RPC -> {
                 Log.error(TAG, "森林任务[$taskTitle] classification=RETRYABLE_RPC decision=RETRY_LATER $detail")
                 false
             }
 
-            ForestTaskFailureType.UNKNOWN_NEEDS_REVIEW -> {
+            TaskRpcFailureType.UNKNOWN_NEEDS_REVIEW -> {
                 Log.error(TAG, "森林任务[$taskTitle] classification=UNKNOWN_NEEDS_REVIEW decision=LOG_ONLY $detail")
                 false
             }
@@ -4147,33 +4098,33 @@ class AntForest : ModelTask(), EnergyCollectCallback {
         TaskBlacklist.addToBlacklist(forestTaskBlacklistModule, taskType, taskTitle)
     }
 
-    private fun classifyForestTaskFailure(response: JSONObject): ForestTaskFailureType {
+    private fun classifyForestTaskFailure(response: JSONObject): TaskRpcFailureType {
         val code = extractForestTaskFailureCode(response)
         val message = extractForestTaskFailureMessage(response)
         return when {
             isForestTaskAlreadyHandled(response) ||
                 containsAnyForest(message, "已领取", "已经领取", "重复领取", "重复领奖", "重复完成", "已完成", "任务已完结", "任务已结束") ->
-                ForestTaskFailureType.TERMINAL_DONE
+                TaskRpcFailureType.TERMINAL_DONE
 
             code == "CAMP_TRIGGER_ERROR" ||
                 code.contains("LIMIT", ignoreCase = true) ||
                 containsAnyForest(message, "上限", "限制", "受限", "不可领取", "资格不足", "兑完", "风控", "风险") ->
-                ForestTaskFailureType.BUSINESS_LIMIT
+                TaskRpcFailureType.BUSINESS_LIMIT
 
             code == "400000040" ||
                 containsAnyForest(message, "不支持rpc调用", "不支持RPC完成") ->
-                ForestTaskFailureType.UNSUPPORTED_NO_CLOSURE
+                TaskRpcFailureType.UNSUPPORTED_NO_CLOSURE
 
             code in setOf("20020012", "TASK_ID_INVALID", "ILLEGAL_ARGUMENT", "PROMISE_TEMPLATE_NOT_EXIST") ||
                 containsAnyForest(message, "参数错误", "任务ID非法", "模板不存在") ->
-                ForestTaskFailureType.NON_RETRYABLE_INVALID
+                TaskRpcFailureType.NON_RETRYABLE_INVALID
 
             code in setOf("3000", "REMOTE_INVOKE_EXCEPTION", "OP_REPEAT_CHECK") ||
                 containsAnyForest(message, "系统出错", "系统繁忙", "稍后", "繁忙", "频繁", "重试") ||
                 isForestFailureMarkedRetryable(response) ->
-                ForestTaskFailureType.RETRYABLE_RPC
+                TaskRpcFailureType.RETRYABLE_RPC
 
-            else -> ForestTaskFailureType.UNKNOWN_NEEDS_REVIEW
+            else -> TaskRpcFailureType.UNKNOWN_NEEDS_REVIEW
         }
     }
 
@@ -4533,33 +4484,6 @@ class AntForest : ModelTask(), EnergyCollectCallback {
         }
     }
 
-    private fun handleLegacyForestGameTask(
-        sceneCode: String,
-        taskType: String,
-        taskTitle: String,
-        awardCount: Int,
-        bizInfo: JSONObject
-    ): Boolean {
-        val gameUrl = bizInfo.optString("taskJumpUrl")
-        if (gameUrl.isNotBlank()) {
-            Log.forest("跳转到游戏: $gameUrl")
-        }
-        Log.forest("森林任务🧾️[$taskTitle] 直接提交完成RPC")
-        val finishTaskResponse = JSONObject(AntForestRpcCall.finishTask(sceneCode, taskType))
-        return if (ResChecker.checkRes(TAG, "完成游戏任务失败:", finishTaskResponse)) {
-            Log.forest("游戏任务完成 🎮️[$taskTitle]# $awardCount 活力值")
-            true
-        } else {
-            handleForestTaskRpcFailure(
-                action = "finishLegacyGameTask",
-                sceneCode = sceneCode,
-                taskType = taskType,
-                taskTitle = taskTitle,
-                response = finishTaskResponse
-            )
-        }
-    }
-
     private fun handleForestTaskNodeRewardOnly(
         taskInfo: JSONObject,
         seenTaskKeys: MutableSet<String>
@@ -4618,6 +4542,230 @@ class AntForest : ModelTask(), EnergyCollectCallback {
                 )
             }
         }
+    }
+
+    private fun completeForestSignTasks(signArray: JSONArray): TaskFlowActionResult {
+        var pendingCount = 0
+        var handledCount = 0
+        var lastFailure: JSONObject? = null
+        for (signIndex in 0 until signArray.length()) {
+            val forestSignVO = signArray.optJSONObject(signIndex) ?: continue
+            val currentSignKey = forestSignVO.optString("currentSignKey")
+            val signId = forestSignVO.optString("signId")
+            val sceneCode = forestSignVO.optString("sceneCode")
+            val signRecords = forestSignVO.optJSONArray("signRecords") ?: continue
+            if (currentSignKey.isBlank() || signId.isBlank() || sceneCode.isBlank()) {
+                continue
+            }
+            for (recordIndex in 0 until signRecords.length()) {
+                val signRecord = signRecords.optJSONObject(recordIndex) ?: continue
+                if (signRecord.optString("signKey") != currentSignKey || signRecord.optBoolean("signed", true)) {
+                    continue
+                }
+                pendingCount++
+                val currentUid = UserMap.currentUid
+                if (currentUid.isNullOrBlank()) {
+                    return TaskFlowActionResult.failure(
+                        failureType = TaskRpcFailureType.UNKNOWN_NEEDS_REVIEW,
+                        code = "MISSING_USER_ID",
+                        message = "森林签到缺少用户ID",
+                        rpc = "AntForestRpcCall.antiepSign",
+                        detail = "action=forestSign signId=$signId sceneCode=$sceneCode"
+                    )
+                }
+                val signRawResponse = AntForestRpcCall.antiepSign(signId, currentUid, sceneCode)
+                if (signRawResponse.isBlank()) {
+                    lastFailure = JSONObject()
+                        .put("code", "EMPTY_RESPONSE")
+                        .put("desc", "森林签到返回空")
+                    break
+                }
+                val signResponse = JSONObject(signRawResponse)
+                GlobalThreadPools.sleepCompat(300)
+                when {
+                    isForestSignAlreadyHandled(signResponse) -> {
+                        Log.forest("森林签到已完成，跳过重复签到")
+                        handledCount++
+                    }
+
+                    ResChecker.checkRes(TAG, "森林签到失败:", signResponse) -> {
+                        val awardCount = signRecord.optInt("awardCount", 0)
+                        val suffix = if (awardCount > 0) "# $awardCount" else ""
+                        Log.forest("森林签到📆成功$suffix")
+                        handledCount++
+                    }
+
+                    else -> {
+                        lastFailure = signResponse
+                    }
+                }
+                break
+            }
+        }
+
+        if (handledCount > 0) {
+            return TaskFlowActionResult.success()
+        }
+        if (pendingCount == 0) {
+            return TaskFlowActionResult.failure(
+                failureType = TaskRpcFailureType.TERMINAL_DONE,
+                code = "NO_PENDING_SIGN",
+                message = "森林签到无待处理记录",
+                rpc = "AntForestRpcCall.antiepSign",
+                detail = "action=forestSign signCount=${signArray.length()}"
+            )
+        }
+
+        val response = lastFailure ?: JSONObject()
+            .put("code", "UNKNOWN_SIGN_FAILURE")
+            .put("desc", "森林签到未完成")
+        return forestTaskActionFailureResult(
+            response = response,
+            rpc = "AntForestRpcCall.antiepSign",
+            detail = "action=forestSign pendingCount=$pendingCount"
+        )
+    }
+
+    private fun receiveForestTaskReward(item: TaskFlowItem): TaskFlowActionResult {
+        val awardText = item.raw?.optInt("awardCount", 0) ?: 0
+        val response = AntForestRpcCall.receiveTaskAward(item.sceneCode, item.type)
+        if (response.isBlank()) {
+            return emptyForestTaskActionResponse("AntForestRpcCall.receiveTaskAward", item, "receiveTaskAward")
+        }
+        val awardResponse = JSONObject(response)
+        return when {
+            isForestTaskAlreadyHandled(awardResponse) -> TaskFlowActionResult.failure(
+                failureType = TaskRpcFailureType.TERMINAL_DONE,
+                code = extractForestTaskFailureCode(awardResponse),
+                message = extractForestTaskFailureMessage(awardResponse),
+                rpc = "AntForestRpcCall.receiveTaskAward",
+                raw = awardResponse.toString(),
+                detail = forestTaskActionDetail(item, "receiveTaskAward")
+            )
+
+            ResChecker.checkRes(TAG, "领取森林任务奖励失败:", awardResponse) -> {
+                val incAwardCount = awardResponse.optInt("incAwardCount", awardText)
+                val displayAwardCount = if (incAwardCount > 0) incAwardCount else awardText
+                Log.forest("森林奖励🎖️[${item.title}]# $displayAwardCount 活力值")
+                GlobalThreadPools.sleepCompat(500)
+                TaskFlowActionResult.success()
+            }
+
+            else -> forestTaskActionFailureResult(
+                response = awardResponse,
+                rpc = "AntForestRpcCall.receiveTaskAward",
+                detail = forestTaskActionDetail(item, "receiveTaskAward")
+            )
+        }
+    }
+
+    private fun completeLegacyForestGameTaskResult(item: TaskFlowItem): TaskFlowActionResult {
+        val bizInfo = item.raw?.optJSONObject("bizInfo") ?: JSONObject()
+        val awardCount = item.raw?.optInt("awardCount", 0) ?: 0
+        val gameUrl = bizInfo.optString("taskJumpUrl")
+        if (gameUrl.isNotBlank()) {
+            Log.forest("跳转到游戏: $gameUrl")
+        }
+        Log.forest("森林任务🧾️[${item.title}] 直接提交完成RPC")
+        val response = AntForestRpcCall.finishTask(item.sceneCode, item.type)
+        if (response.isBlank()) {
+            return emptyForestTaskActionResponse("AntForestRpcCall.finishTask", item, "finishLegacyGameTask")
+        }
+        val finishTaskResponse = JSONObject(response)
+        return if (ResChecker.checkRes(TAG, "完成游戏任务失败:", finishTaskResponse)) {
+            Log.forest("游戏任务完成 🎮️[${item.title}]# $awardCount 活力值")
+            TaskFlowActionResult.success()
+        } else {
+            forestTaskActionFailureResult(
+                response = finishTaskResponse,
+                rpc = "AntForestRpcCall.finishTask",
+                detail = forestTaskActionDetail(item, "finishLegacyGameTask")
+            )
+        }
+    }
+
+    private fun completeOrdinaryForestTask(item: TaskFlowItem): TaskFlowActionResult {
+        val bizKey = buildForestTaskKey(item.sceneCode, item.type)
+        forestTaskTryCount.computeIfAbsent(bizKey) { AtomicInteger(0) }.incrementAndGet()
+        val response = AntForestRpcCall.finishTask(item.sceneCode, item.type)
+        if (response.isBlank()) {
+            return emptyForestTaskActionResponse("AntForestRpcCall.finishTask", item, "finishTask")
+        }
+        val finishTaskResponse = JSONObject(response)
+        return when {
+            isForestTaskAlreadyHandled(finishTaskResponse) -> TaskFlowActionResult.failure(
+                failureType = TaskRpcFailureType.TERMINAL_DONE,
+                code = extractForestTaskFailureCode(finishTaskResponse),
+                message = extractForestTaskFailureMessage(finishTaskResponse),
+                rpc = "AntForestRpcCall.finishTask",
+                raw = finishTaskResponse.toString(),
+                detail = forestTaskActionDetail(item, "finishTask")
+            )
+
+            ResChecker.checkRes(TAG, "完成森林任务失败:", finishTaskResponse) -> {
+                forestTaskTryCount.remove(bizKey)
+                Log.forest("森林任务🧾️[${item.title}]")
+                TaskFlowActionResult.success()
+            }
+
+            else -> forestTaskActionFailureResult(
+                response = finishTaskResponse,
+                rpc = "AntForestRpcCall.finishTask",
+                detail = forestTaskActionDetail(item, "finishTask")
+            )
+        }
+    }
+
+    private fun emptyForestTaskActionResponse(
+        rpc: String,
+        item: TaskFlowItem,
+        action: String
+    ): TaskFlowActionResult {
+        return TaskFlowActionResult.failure(
+            failureType = TaskRpcFailureType.RETRYABLE_RPC,
+            message = "${action}返回空",
+            rpc = rpc,
+            detail = forestTaskActionDetail(item, action),
+            stopCurrentRound = true
+        )
+    }
+
+    private fun missingForestTaskRawResult(item: TaskFlowItem, action: String): TaskFlowActionResult {
+        return TaskFlowActionResult.failure(
+            failureType = TaskRpcFailureType.UNKNOWN_NEEDS_REVIEW,
+            message = "缺少森林任务原始数据",
+            rpc = "ForestTaskFlowAdapter.$action",
+            detail = forestTaskActionDetail(item, action)
+        )
+    }
+
+    private fun forestTaskActionFailureResult(
+        response: JSONObject,
+        rpc: String,
+        detail: String
+    ): TaskFlowActionResult {
+        val code = extractForestTaskFailureCode(response)
+        val message = extractForestTaskFailureMessage(response)
+        return TaskFlowActionResult.failure(
+            failureType = classifyForestTaskFailure(response),
+            code = code,
+            message = message,
+            rpc = rpc,
+            raw = response.toString(),
+            detail = detail
+        )
+    }
+
+    private fun forestTaskActionDetail(item: TaskFlowItem, action: String): String {
+        return "taskType=${item.type} sceneCode=${item.sceneCode} action=$action"
+    }
+
+    private fun buildForestTaskKey(sceneCode: String, taskType: String): String {
+        return "$sceneCode#$taskType"
+    }
+
+    private fun hasForestTaskChildren(item: TaskFlowItem): Boolean {
+        return item.raw?.optBoolean("hasChildren", false) == true
     }
 
     private fun hasEnergyRainCollectHint(takeLookEndPayload: JSONObject): Boolean {
@@ -4686,115 +4834,245 @@ class AntForest : ModelTask(), EnergyCollectCallback {
         }
     }
 
-    private fun handleForestTaskNode(taskInfo: JSONObject, seenTaskKeys: MutableSet<String>): Boolean {
-        val taskBaseInfo = taskInfo.optJSONObject("taskBaseInfo") ?: return false
-        val taskType = taskBaseInfo.optString("taskType")
-        val sceneCode = taskBaseInfo.optString("sceneCode")
-        val taskStatus = taskBaseInfo.optString("taskStatus")
-        if (taskType.isBlank() || sceneCode.isBlank()) {
-            return false
+    private inner class ForestTaskFlowAdapter(
+        private val taskSources: List<Pair<String, () -> String>>,
+        private val deferredForestRightsTasks: MutableMap<String, DeferredForestRightsTask>
+    ) : TaskFlowAdapter {
+        override val moduleName: String = forestTaskBlacklistModule
+        override val flowName: String = "森林任务"
+
+        override fun query(): JSONObject {
+            val responseArray = JSONArray()
+            val uniqueSigns = linkedMapOf<String, JSONObject>()
+            for ((sourceName, request) in taskSources) {
+                val taskResponse = queryForestTaskSource(sourceName, request) ?: continue
+                responseArray.put(
+                    JSONObject()
+                        .put("sourceName", sourceName)
+                        .put("payload", taskResponse)
+                )
+                if ("popupTask" == sourceName) {
+                    appendSignInfo(taskResponse.optJSONObject("energySignVO"), uniqueSigns)
+                }
+                appendSignInfo(taskResponse.optJSONArray("forestSignVOList"), uniqueSigns)
+            }
+
+            val signArray = JSONArray()
+            uniqueSigns.values.forEach { signArray.put(it) }
+            return JSONObject()
+                .put("success", true)
+                .put("responses", responseArray)
+                .put("signs", signArray)
         }
 
-        val uniqueTaskKey = "$sceneCode#$taskType"
-        if (!seenTaskKeys.add(uniqueTaskKey)) {
-            return false
+        override fun isQuerySuccess(response: JSONObject): Boolean {
+            return response.optBoolean("success", true)
         }
 
-        if (isGreenPracticeChildTask(taskBaseInfo, taskType)) {
-            return false
-        }
-        if (isGreenPracticeParentTask(taskBaseInfo, taskType)) {
-            return handleGreenPracticeTask(taskInfo)
-        }
+        override fun extractItems(response: JSONObject): List<TaskFlowItem> {
+            val items = mutableListOf<TaskFlowItem>()
+            val signs = response.optJSONArray("signs")
+            if (signs != null && hasPendingForestSign(signs)) {
+                items.add(
+                    TaskFlowItem(
+                        id = FOREST_SIGN_TASK_TYPE,
+                        title = "森林签到",
+                        status = TaskStatus.TODO.name,
+                        type = FOREST_SIGN_TASK_TYPE,
+                        actionType = "SIGN",
+                        blacklistKeys = emptyList(),
+                        raw = JSONObject().put("signs", signs),
+                        progress = "signCount=${signs.length()}"
+                    )
+                )
+            }
 
-        val bizInfo = parseTaskBizInfo(taskBaseInfo)
-        val taskRights = parseTaskRights(taskInfo)
-        val awardCount = taskRights.optInt("awardCount", 0)
-        val taskTitle = sequenceOf(
-            bizInfo.optString("taskTitle"),
-            bizInfo.optString("title"),
-            bizInfo.optString("taskDesc"),
-            bizInfo.optString("taskContent"),
-            taskType
-        ).firstOrNull { it.isNotBlank() } ?: taskType
-
-        if (Thread.currentThread().isInterrupted) {
-            return false
-        }
-
-        return when {
-            taskStatus == TaskStatus.FINISHED.name || taskStatus == "COMPLETE" -> {
-                val awardResponse = JSONObject(AntForestRpcCall.receiveTaskAward(sceneCode, taskType))
-                when {
-                    isForestTaskAlreadyHandled(awardResponse) -> {
-                        Log.forest("奖励已领取: $taskTitle")
-                        false
+            val seenTaskKeys = mutableSetOf<String>()
+            val responses = response.optJSONArray("responses") ?: return items
+            for (i in 0 until responses.length()) {
+                val payload = responses.optJSONObject(i)?.optJSONObject("payload") ?: continue
+                val taskNodes = collectForestTaskNodes(payload)
+                for (taskInfo in taskNodes) {
+                    val taskBaseInfo = taskInfo.optJSONObject("taskBaseInfo") ?: continue
+                    val taskType = taskBaseInfo.optString("taskType")
+                    val sceneCode = taskBaseInfo.optString("sceneCode")
+                    if (taskType.isBlank() || sceneCode.isBlank()) {
+                        continue
                     }
-
-                    ResChecker.checkRes(TAG, "领取森林任务奖励失败:", awardResponse) -> {
-                        val incAwardCount = awardResponse.optInt("incAwardCount", awardCount)
-                        val displayAwardCount = if (incAwardCount > 0) incAwardCount else awardCount
-                        Log.forest("森林奖励🎖️[$taskTitle]# $displayAwardCount 活力值")
-                        GlobalThreadPools.sleepCompat(500)
-                        true
+                    val taskKey = buildForestTaskKey(sceneCode, taskType)
+                    if (!seenTaskKeys.add(taskKey)) {
+                        continue
                     }
+                    appendDeferredForestRightsTask(taskInfo, deferredForestRightsTasks)
 
-                    else -> {
-                        handleForestTaskRpcFailure(
-                            action = "receiveTaskAward",
+                    val bizInfo = parseTaskBizInfo(taskBaseInfo)
+                    val taskRights = parseTaskRights(taskInfo)
+                    val awardCount = taskRights.optInt("awardCount", 0)
+                    val taskStatus = taskBaseInfo.optString("taskStatus")
+                    val taskProgress = taskBaseInfo.optInt("taskProgress", 0)
+                    val taskRequire = taskBaseInfo.optInt("taskRequire", 0).takeIf { it > 0 }
+                    val hasChildren = taskInfo.optJSONArray("childTaskTypeList")?.length()?.let { it > 0 } ?: false
+                    val taskTitle = getForestTaskTitle(taskBaseInfo, taskType)
+                    val raw = JSONObject()
+                        .put("taskInfo", taskInfo)
+                        .put("taskBaseInfo", taskBaseInfo)
+                        .put("bizInfo", bizInfo)
+                        .put("taskRights", taskRights)
+                        .put("taskKey", taskKey)
+                        .put("awardCount", awardCount)
+                        .put("hasChildren", hasChildren)
+
+                    items.add(
+                        TaskFlowItem(
+                            id = taskType,
+                            title = taskTitle,
+                            status = taskStatus,
+                            type = taskType,
                             sceneCode = sceneCode,
-                            taskType = taskType,
-                            taskTitle = taskTitle,
-                            response = awardResponse,
-                            terminalResult = false
+                            actionType = taskBaseInfo.optString("actionType")
+                                .ifBlank { bizInfo.optString("actionType") },
+                            blacklistKeys = listOf(taskType, taskTitle).filter { it.isNotBlank() },
+                            raw = raw,
+                            progress = "award=$awardCount progress=$taskProgress/${taskRequire ?: 0}",
+                            current = taskProgress,
+                            limit = taskRequire
                         )
+                    )
+                }
+            }
+            return items
+        }
+
+        override fun mapPhase(item: TaskFlowItem): TaskFlowPhase {
+            if (item.type == FOREST_SIGN_TASK_TYPE) {
+                return TaskFlowPhase.READY_TO_COMPLETE
+            }
+            return when (item.status) {
+                TaskStatus.FINISHED.name,
+                "COMPLETE",
+                "WAIT_RECEIVE",
+                "TO_RECEIVE" -> TaskFlowPhase.REWARD_READY
+
+                TaskStatus.TODO.name,
+                "WAIT_COMPLETE" -> when {
+                    isGreenPracticeChildItem(item) -> TaskFlowPhase.BUSINESS_ACTION
+                    isGreenPracticeParentItem(item) -> TaskFlowPhase.READY_TO_COMPLETE
+                    hasForestTaskChildren(item) -> TaskFlowPhase.BUSINESS_ACTION
+                    else -> TaskFlowPhase.READY_TO_COMPLETE
+                }
+
+                TaskStatus.RECEIVED.name,
+                "HAS_RECEIVED",
+                "DONE",
+                "COMPLETED" -> TaskFlowPhase.TERMINAL
+
+                else -> TaskFlowPhase.UNKNOWN
+            }
+        }
+
+        override fun shouldSkip(item: TaskFlowItem): Boolean {
+            return Thread.currentThread().isInterrupted ||
+                isGreenPracticeChildItem(item)
+        }
+
+        override fun receive(item: TaskFlowItem): TaskFlowActionResult {
+            return receiveForestTaskReward(item)
+        }
+
+        override fun complete(item: TaskFlowItem): TaskFlowActionResult {
+            if (item.type == FOREST_SIGN_TASK_TYPE) {
+                val signs = item.raw?.optJSONArray("signs") ?: JSONArray()
+                return completeForestSignTasks(signs)
+            }
+            if (isGreenPracticeParentItem(item)) {
+                val taskInfo = item.raw?.optJSONObject("taskInfo")
+                    ?: return missingForestTaskRawResult(item, "finishGreenPracticeTask")
+                return if (handleGreenPracticeTask(taskInfo)) {
+                    TaskFlowActionResult.success()
+                } else {
+                    TaskFlowActionResult.failure(
+                        failureType = TaskRpcFailureType.UNKNOWN_NEEDS_REVIEW,
+                        message = "绿色践行任务本轮未推进",
+                        rpc = "AntForestRpcCall.finishTask",
+                        detail = forestTaskActionDetail(item, "finishGreenPracticeTask")
+                    )
+                }
+            }
+            if (item.type == LEGACY_FOREST_GAME_TASK_TYPE) {
+                return completeLegacyForestGameTaskResult(item)
+            }
+            return completeOrdinaryForestTask(item)
+        }
+
+        override fun actionKey(item: TaskFlowItem, action: TaskFlowAction): String {
+            if (item.type == FOREST_SIGN_TASK_TYPE) {
+                return "${action.logName}:$FOREST_SIGN_TASK_TYPE"
+            }
+            val taskKey = buildForestTaskKey(item.sceneCode, item.type)
+            return when (action) {
+                TaskFlowAction.RECEIVE -> "receive:$taskKey"
+                TaskFlowAction.COMPLETE -> "complete:$taskKey"
+                else -> super<TaskFlowAdapter>.actionKey(item, action)
+            }
+        }
+
+        override fun afterSuccess(item: TaskFlowItem, action: TaskFlowAction, result: TaskFlowActionResult) {
+            if (action == TaskFlowAction.COMPLETE && item.type != FOREST_SIGN_TASK_TYPE) {
+                forestTaskTryCount.remove(buildForestTaskKey(item.sceneCode, item.type))
+            }
+        }
+
+        override fun afterFailure(
+            item: TaskFlowItem,
+            action: TaskFlowAction,
+            result: TaskFlowActionResult,
+            decision: TaskFlowDecision
+        ) {
+            if (action == TaskFlowAction.COMPLETE &&
+                item.type != FOREST_SIGN_TASK_TYPE &&
+                (decision == TaskFlowDecision.MARK_HANDLED || decision == TaskFlowDecision.BLACKLIST)
+            ) {
+                forestTaskTryCount.remove(buildForestTaskKey(item.sceneCode, item.type))
+            }
+        }
+
+        override fun onQueryFailed(response: JSONObject) {
+            Log.error(TAG, "森林任务列表查询失败 raw=$response")
+        }
+
+        override fun logInfo(message: String) {
+            Log.forest(message)
+        }
+
+        override fun logError(message: String) {
+            Log.error(TAG, message)
+        }
+
+        private fun hasPendingForestSign(signs: JSONArray): Boolean {
+            for (signIndex in 0 until signs.length()) {
+                val forestSignVO = signs.optJSONObject(signIndex) ?: continue
+                val currentSignKey = forestSignVO.optString("currentSignKey")
+                val signRecords = forestSignVO.optJSONArray("signRecords") ?: continue
+                for (recordIndex in 0 until signRecords.length()) {
+                    val signRecord = signRecords.optJSONObject(recordIndex) ?: continue
+                    if (signRecord.optString("signKey") == currentSignKey &&
+                        !signRecord.optBoolean("signed", true)
+                    ) {
+                        return true
                     }
                 }
             }
+            return false
+        }
 
-            taskStatus == TaskStatus.TODO.name -> {
-                if (TaskBlacklist.isTaskInBlacklist(forestTaskBlacklistModule, taskType) ||
-                    TaskBlacklist.isTaskInBlacklist(forestTaskBlacklistModule, taskTitle)
-                ) {
-                    return false
-                }
-                val childTaskTypeList = taskInfo.optJSONArray("childTaskTypeList")
-                if (childTaskTypeList != null && childTaskTypeList.length() > 0) {
-                    return false
-                }
-                if ("mokuai_senlin_hlz" == taskType) {
-                    return handleLegacyForestGameTask(sceneCode, taskType, taskTitle, awardCount, bizInfo)
-                }
-                val bizKey = "${sceneCode}_$taskType"
-                forestTaskTryCount.computeIfAbsent(bizKey) { AtomicInteger(0) }.incrementAndGet()
-                val finishTaskResponse = JSONObject(AntForestRpcCall.finishTask(sceneCode, taskType))
-                when {
-                    isForestTaskAlreadyHandled(finishTaskResponse) -> {
-                        forestTaskTryCount.remove(bizKey)
-                        Log.forest("任务已完结: $taskTitle")
-                        true
-                    }
+        private fun isGreenPracticeParentItem(item: TaskFlowItem): Boolean {
+            val taskBaseInfo = item.raw?.optJSONObject("taskBaseInfo") ?: return false
+            return isGreenPracticeParentTask(taskBaseInfo, item.type)
+        }
 
-                    ResChecker.checkRes(TAG, "完成森林任务失败:", finishTaskResponse) -> {
-                        forestTaskTryCount.remove(bizKey)
-                        Log.forest("森林任务🧾️[$taskTitle]")
-                        true
-                    }
-
-                    else -> {
-                        handleForestTaskRpcFailure(
-                            action = "finishTask",
-                            sceneCode = sceneCode,
-                            taskType = taskType,
-                            taskTitle = taskTitle,
-                            response = finishTaskResponse,
-                            tryKey = bizKey
-                        )
-                    }
-                }
-            }
-
-            else -> false
+        private fun isGreenPracticeChildItem(item: TaskFlowItem): Boolean {
+            val taskBaseInfo = item.raw?.optJSONObject("taskBaseInfo") ?: return false
+            return isGreenPracticeChildTask(taskBaseInfo, item.type)
         }
     }
 
@@ -4815,54 +5093,10 @@ class AntForest : ModelTask(), EnergyCollectCallback {
                 "home_task_list" to { AntForestRpcCall.queryTaskList() }
             )
             val deferredForestRightsTasks = linkedMapOf<String, DeferredForestRightsTask>()
-
-            var loopCount = 0
-            while (loopCount < 8 && !Thread.currentThread().isInterrupted) {
-                loopCount++
-                if (Thread.currentThread().isInterrupted) {
-                    return
-                }
-
-                var doubleCheck = false
-                val queriedTaskSources = mutableListOf<JSONObject>()
-                val uniqueSigns = linkedMapOf<String, JSONObject>()
-
-                for ((sourceName, request) in taskSources) {
-                    val taskResponse = queryForestTaskSource(sourceName, request) ?: continue
-                    queriedTaskSources.add(taskResponse)
-                    if ("popupTask" == sourceName) {
-                        appendSignInfo(taskResponse.optJSONObject("energySignVO"), uniqueSigns)
-                    }
-                    appendSignInfo(taskResponse.optJSONArray("forestSignVOList"), uniqueSigns)
-                }
-
-                if (queriedTaskSources.isEmpty()) {
-                    break
-                }
-
-                if (uniqueSigns.isNotEmpty()) {
-                    val signArray = JSONArray()
-                    uniqueSigns.values.forEach { signArray.put(it) }
-                    if (dailyTask(signArray) > 0) {
-                        doubleCheck = true
-                    }
-                }
-
-                val seenTaskKeys = mutableSetOf<String>()
-                for (taskResponse in queriedTaskSources) {
-                    val taskNodes = collectForestTaskNodes(taskResponse)
-                    for (taskNode in taskNodes) {
-                        appendDeferredForestRightsTask(taskNode, deferredForestRightsTasks)
-                        if (handleForestTaskNode(taskNode, seenTaskKeys)) {
-                            doubleCheck = true
-                        }
-                    }
-                }
-
-                if (!doubleCheck) {
-                    break
-                }
-            }
+            TaskFlowEngine(
+                ForestTaskFlowAdapter(taskSources, deferredForestRightsTasks),
+                roundSleepMs = 500L
+            ).run()
             collectDeferredForestRights(deferredForestRightsTasks.values)
         } catch (t: Throwable) {
             handleException("receiveTaskAward", t)
@@ -7296,6 +7530,8 @@ class AntForest : ModelTask(), EnergyCollectCallback {
         private const val FRIEND_HOME_MIN_INTERVAL_MS = 2000
         private const val GIFT7TH_SIGN_SCENE_CODE = "ANTFOREST_GIFT7TH_SIGN_202506"
         private const val GIFT7TH_SIGN_SOURCE = "chInfo_ch_appcenter__chsub_9patch"
+        private const val FOREST_SIGN_TASK_TYPE = "__FOREST_SIGN__"
+        private const val LEGACY_FOREST_GAME_TASK_TYPE = "mokuai_senlin_hlz"
         private const val ROB_MULTIPLIER_PROLONG_THRESHOLD_MS = 14 * 24 * 60 * 60 * 1000L
         private const val ROB_MULTIPLIER_FACTOR_EPS = 0.0001
 
@@ -7654,4 +7890,3 @@ class AntForest : ModelTask(), EnergyCollectCallback {
         }
     }
 }
-
