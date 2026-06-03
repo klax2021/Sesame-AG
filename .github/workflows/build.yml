@@ -40,11 +40,12 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: ./gradlew assembleRelease
 
-      - name: Rename APK
+      - name: Rename APK(only arm64-v8a)
         env:
           VER: ${{ env.APP_VER }}
         run: |
-          SRC_APK=$(find app/build/outputs/apk/release -name "*.apk")
+          # 精准只筛选arm64-v8a的apk
+          SRC_APK=$(find app/build/outputs/apk/release -name "*arm64-v8a*.apk" | head -1)
           mv "$SRC_APK" "./Sesame-TK-arm64-v8a-${VER}-signed.apk"
 
       - name: Upload APK
