@@ -2,59 +2,82 @@ name: Build Signed APK
 on:
   push:
     tags:
-      - '*' # 匹配所有格式tag：4017-0.1.0这类，上游同步tag自动触发构建
-  workflow_dispatch: # 保留手动触发入口（永远在main分支运行）
+      - '*'       # 上游同步新TAG自动触发打包（全自动）
+  workflow_dispatch: # 手动只能选main启动脚本
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          # ==========手动打包关键：手动运行时，自动拉最新tag源码
-          fetch-depth: 0
+          fetch-depth: 0 # 拉取全部标签，用来筛选最新TAG
 
-      # 自动识别：tag触发=切当前tag；手动dispatch=自动切换到仓库最新tag代码
-      - name: Switch latest tag when manual run
+      - name: 1. 自动切换源码
         run: |
-          if [[ "${GITHUB_REF}" != refs/tags/* ]];then
-            LATEST_TAG=$(git tag | sort -t'-' -k1 -n | tail -n1)
+          # TAG推送自动触发：使用当前TAG源码
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG=${GITHUB_REF#refs/tags/}
+            echo "APP_VER=${TAG#*-}" >> $GITHUB_ENV
+          else
+            # 手动main启动：筛选编号最大最新TAG，切AG源码
+            LATEST_TAG=$(git tag | sort -t'-' -k1 -n | tail -1)
             git checkout $LATEST_TAG
             echo "APP_VER=${LATEST_TAG#*-}" >> $GITHUB_ENV
-          else
-            TAG_NAME=${GITHUB_REF#refs/tags/}
-            echo "APP_VER=${TAG_NAME#*-}" >> $GITHUB_ENV
           fi
 
-      - uses: actions/setup-java@v4
+      - name: 预配置Java
+        uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: temurin
 
-      - name: Decode Keystore
+      - name: 2. 动态注入签名配置
+        run: |
+          cat << 'EOF' > app/signing.gradle
+          android {
+            if (System.getenv("KEYSTORE_PASSWORD") != null) {
+              signingConfigs {
+                release {
+                  storeFile file("mykey.jks")
+                  storePassword System.getenv("KEYSTORE_PASSWORD")
+                  keyAlias System.getenv("KEY_ALIAS")
+                  keyPassword System.getenv("KEY_PASSWORD")
+                }
+              }
+              buildTypes {
+                release {
+                  signingConfig signingConfigs.release
+                }
+              }
+            }
+          }
+          EOF
+          echo -e "\napply from: 'signing.gradle'" >> app/build.gradle
+
+      - name: 3. Decode Keystore
         env:
           KEYSTORE: ${{ secrets.KEYSTORE }}
-        run: echo "$KEYSTORE" | base64 -d > app/mykey.jks
+        run: echo -n "$KEYSTORE" | base64 -d > app/mykey.jks
 
-      - name: Make gradlew executable
+      - name: 4. Make gradlew executable
         run: chmod +x gradlew
 
-      - name: Build Release APK
+      - name: 5. Build Release APK
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: ./gradlew assembleRelease
 
-      - name: Rename APK(only arm64-v8a)
+      - name: 6. Rename APK(only arm64-v8a)
         env:
           VER: ${{ env.APP_VER }}
         run: |
           SRC_APK=$(find app/build/outputs/apk/release -name "*arm64-v8a*.apk" | head -1)
           mv "$SRC_APK" "./Sesame-TK-arm64-v8a-${VER}-signed.apk"
 
-      - name: Upload APK
+      - name: 7. Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: Signed-APK
