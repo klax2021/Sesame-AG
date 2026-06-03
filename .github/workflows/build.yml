@@ -2,23 +2,30 @@ name: Build Signed APK
 on:
   push:
     tags:
-      - 'v*'
-  workflow_dispatch:
+      - '*' # 匹配所有格式tag：4017-0.1.0这类，上游同步tag自动触发构建
+  workflow_dispatch: # 保留手动触发入口（永远在main分支运行）
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # ==========手动打包关键：手动运行时，自动拉最新tag源码
+          fetch-depth: 0
 
-      - name: Set version env
+      # 自动识别：tag触发=切当前tag；手动dispatch=自动切换到仓库最新tag代码
+      - name: Switch latest tag when manual run
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]];then
-            APP_VER=${GITHUB_REF#refs/tags/v}
+          if [[ "${GITHUB_REF}" != refs/tags/* ]];then
+            LATEST_TAG=$(git tag | sort -t'-' -k1 -n | tail -n1)
+            git checkout $LATEST_TAG
+            echo "APP_VER=${LATEST_TAG#*-}" >> $GITHUB_ENV
           else
-            APP_VER=dev
+            TAG_NAME=${GITHUB_REF#refs/tags/}
+            echo "APP_VER=${TAG_NAME#*-}" >> $GITHUB_ENV
           fi
-          echo "APP_VER=$APP_VER" >> $GITHUB_ENV
 
       - uses: actions/setup-java@v4
         with:
@@ -38,17 +45,12 @@ jobs:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-        run: |
-          export ORG_GRADLE_PROJECT_agBuild=true
-          export ORG_GRADLE_PROJECT_onlyArm64=true
-          export ORG_GRADLE_PROJECT_isRelease=true
-          ./gradlew assembleRelease
+        run: ./gradlew assembleRelease
 
       - name: Rename APK(only arm64-v8a)
         env:
           VER: ${{ env.APP_VER }}
         run: |
-          # 精准只筛选arm64-v8a的apk
           SRC_APK=$(find app/build/outputs/apk/release -name "*arm64-v8a*.apk" | head -1)
           mv "$SRC_APK" "./Sesame-TK-arm64-v8a-${VER}-signed.apk"
 
