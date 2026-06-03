@@ -11,6 +11,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set TAG env
+        run: |
+          echo "APP_VER=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
+
       - uses: actions/setup-java@v4
         with:
           java-version: '17'
@@ -31,8 +35,14 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: ./gradlew assembleRelease
 
+      - name: Rename APK
+        env:
+          VER: ${{ env.APP_VER }}
+        run: |
+          mv app/build/outputs/apk/release/*.apk ./Sesame-TK-arm64-v8a-${VER}-signed.apk
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: Signed-APK
-          path: app/build/outputs/apk/release/*.apk
+          path: Sesame-TK-arm64-v8a-${{ env.APP_VER }}-signed.apk
