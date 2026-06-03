@@ -11,9 +11,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set TAG env
+      - name: Set version env
         run: |
-          echo "APP_VER=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]];then
+            APP_VER=${GITHUB_REF#refs/tags/v}
+          else
+            APP_VER=dev
+          fi
+          echo "APP_VER=$APP_VER" >> $GITHUB_ENV
 
       - uses: actions/setup-java@v4
         with:
@@ -39,7 +44,8 @@ jobs:
         env:
           VER: ${{ env.APP_VER }}
         run: |
-          mv app/build/outputs/apk/release/*.apk ./Sesame-TK-arm64-v8a-${VER}-signed.apk
+          SRC_APK=$(find app/build/outputs/apk/release -name "*.apk")
+          mv "$SRC_APK" "./Sesame-TK-arm64-v8a-${VER}-signed.apk"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
