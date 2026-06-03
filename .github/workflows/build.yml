@@ -15,12 +15,10 @@ jobs:
 
       - name: 1. 自动切换源码
         run: |
-          # TAG推送自动触发：使用当前TAG源码
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             TAG=${GITHUB_REF#refs/tags/}
             echo "APP_VER=${TAG#*-}" >> $GITHUB_ENV
           else
-            # 手动main启动：筛选编号最大最新TAG，切换到对应源码
             LATEST_TAG=$(git tag | sort -t'-' -k1 -n | tail -1)
             if [ -n "$LATEST_TAG" ]; then
               git checkout $LATEST_TAG
@@ -36,15 +34,15 @@ jobs:
           java-version: '17'
           distribution: temurin
 
-      - name: 2. 动态注入个人签名与架构精简配置（Kotlin DSL 专配版）
+      - name: 2. 动态注入个人签名与架构精简配置（顺应原厂优化版）
         run: |
-          # 针对原生的 app/build.gradle.kts 末尾追加严格符合 Kotlin 规范的定制代码
+          # 仅追加架构过滤与签名，不再强行干涉 isMinifyEnabled，直接沿用作者的 12M 混淆优化方案
           cat << 'EOF' >> app/build.gradle.kts
 
           android {
               defaultConfig {
                   ndk {
-                      // 强制清空其余架构，只保留 arm64-v8a 精简体积
+                      // 依然强行只保留 arm64-v8a 架构
                       abiFilters.clear()
                       abiFilters.add("arm64-v8a")
                   }
@@ -61,17 +59,8 @@ jobs:
                   }
                   buildTypes {
                       getByName("release") {
-                          // 明确关闭混淆与资源缩减，保障插件或模块绝对稳健运行
-                          isMinifyEnabled = false
-                          isShrinkResources = false
+                          // 仅注入签名，混淆开关完全交给作者源码控制
                           signingConfig = signingConfigs.getByName("customRelease")
-                      }
-                  }
-              } else {
-                  buildTypes {
-                      getByName("release") {
-                          isMinifyEnabled = false
-                          isShrinkResources = false
                       }
                   }
               }
@@ -97,7 +86,6 @@ jobs:
         env:
           VER: ${{ env.APP_VER }}
         run: |
-          # 动态匹配生成的 release 目录下的 apk
           SRC_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -1)
           mv "$SRC_APK" "./Sesame-AG-arm64-v8a-${VER}-signed.apk"
 
