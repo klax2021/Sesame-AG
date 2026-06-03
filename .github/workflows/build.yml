@@ -20,10 +20,14 @@ jobs:
             TAG=${GITHUB_REF#refs/tags/}
             echo "APP_VER=${TAG#*-}" >> $GITHUB_ENV
           else
-            # 手动main启动：筛选编号最大最新TAG，切AG源码
+            # 手动main启动：筛选编号最大最新TAG，切换到对应源码
             LATEST_TAG=$(git tag | sort -t'-' -k1 -n | tail -1)
-            git checkout $LATEST_TAG
-            echo "APP_VER=${LATEST_TAG#*-}" >> $GITHUB_ENV
+            if [ -n "$LATEST_TAG" ]; then
+              git checkout $LATEST_TAG
+              echo "APP_VER=${LATEST_TAG#*-}" >> $GITHUB_ENV
+            else
+              echo "APP_VER=dev" >> $GITHUB_ENV
+            fi
           fi
 
       - name: 预配置Java
@@ -32,39 +36,45 @@ jobs:
           java-version: '17'
           distribution: temurin
 
-      - name: 2. 动态注入个人签名与架构精简配置
+      - name: 2. 动态注入个人签名与架构精简配置（Kotlin DSL 专配版）
         run: |
-          # 切完源码后，直接向 app/build.gradle 末尾追加你的专属配置
-          cat << 'EOF' >> app/build.gradle
+          # 针对原生的 app/build.gradle.kts 末尾追加严格符合 Kotlin 规范的定制代码
+          cat << 'EOF' >> app/build.gradle.kts
 
           android {
-            // 极致瘦身：强制只保留 arm64-v8a 架构
-            defaultConfig {
-              ndk {
-                abiFilters 'arm64-v8a'
+              defaultConfig {
+                  ndk {
+                      // 强制清空其余架构，只保留 arm64-v8a 精简体积
+                      abiFilters.clear()
+                      abiFilters.add("arm64-v8a")
+                  }
               }
-            }
-
-            if (System.getenv("KEYSTORE_PASSWORD") != null) {
-              signingConfigs {
-                release {
-                  storeFile file("mykey.jks")
-                  storePassword System.getenv("KEYSTORE_PASSWORD")
-                  keyAlias System.getenv("KEY_ALIAS")
-                  keyPassword System.getenv("KEY_PASSWORD")
-                }
+              
+              if (System.getenv("KEYSTORE_PASSWORD") != null) {
+                  signingConfigs {
+                      maybeCreate("customRelease").apply {
+                          storeFile = file("mykey.jks")
+                          storePassword = System.getenv("KEYSTORE_PASSWORD")
+                          keyAlias = System.getenv("KEY_ALIAS")
+                          keyPassword = System.getenv("KEY_PASSWORD")
+                      }
+                  }
+                  buildTypes {
+                      getByName("release") {
+                          // 明确关闭混淆与资源缩减，保障插件或模块绝对稳健运行
+                          isMinifyEnabled = false
+                          isShrinkResources = false
+                          signingConfig = signingConfigs.getByName("customRelease")
+                      }
+                  }
+              } else {
+                  buildTypes {
+                      getByName("release") {
+                          isMinifyEnabled = false
+                          isShrinkResources = false
+                      }
+                  }
               }
-              buildTypes {
-                release {
-                  // 使用标准 API 确保高版本 Gradle 映射成功
-                  signingConfig signingConfigs.findByName('release')
-                  
-                  // 明确关闭混淆与资源缩减，确保 Xposed 模块/插件绝对不闪退
-                  minifyEnabled false
-                  shrinkResources false
-                }
-              }
-            }
           }
           EOF
 
@@ -87,11 +97,12 @@ jobs:
         env:
           VER: ${{ env.APP_VER }}
         run: |
-          SRC_APK=$(find app/build/outputs/apk/release -name "*arm64-v8a*.apk" | head -1)
-          mv "$SRC_APK" "./Sesame-TK-arm64-v8a-${VER}-signed.apk"
+          # 动态匹配生成的 release 目录下的 apk
+          SRC_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -1)
+          mv "$SRC_APK" "./Sesame-AG-arm64-v8a-${VER}-signed.apk"
 
       - name: 7. Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: Signed-APK
-          path: Sesame-TK-arm64-v8a-${{ env.APP_VER }}-signed.apk
+          path: Sesame-AG-arm64-v8a-${{ env.APP_VER }}-signed.apk
