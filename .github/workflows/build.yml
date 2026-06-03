@@ -32,10 +32,19 @@ jobs:
           java-version: '17'
           distribution: temurin
 
-      - name: 2. 动态注入签名配置
+      - name: 2. 动态注入个人签名与架构精简配置
         run: |
-          cat << 'EOF' > app/signing.gradle
+          # 切完源码后，直接向 app/build.gradle 末尾追加你的专属配置
+          cat << 'EOF' >> app/build.gradle
+
           android {
+            // 极致瘦身：强制只保留 arm64-v8a 架构
+            defaultConfig {
+              ndk {
+                abiFilters 'arm64-v8a'
+              }
+            }
+
             if (System.getenv("KEYSTORE_PASSWORD") != null) {
               signingConfigs {
                 release {
@@ -47,13 +56,17 @@ jobs:
               }
               buildTypes {
                 release {
-                  signingConfig signingConfigs.release
+                  // 使用标准 API 确保高版本 Gradle 映射成功
+                  signingConfig signingConfigs.findByName('release')
+                  
+                  // 明确关闭混淆与资源缩减，确保 Xposed 模块/插件绝对不闪退
+                  minifyEnabled false
+                  shrinkResources false
                 }
               }
             }
           }
           EOF
-          echo -e "\napply from: 'signing.gradle'" >> app/build.gradle
 
       - name: 3. Decode Keystore
         env:
