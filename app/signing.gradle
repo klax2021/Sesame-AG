@@ -1,3 +1,4 @@
+apply from: 'signing.gradle'
 android {
   if (System.getenv("KEYSTORE_PASSWORD") != null) {
     signingConfigs {
