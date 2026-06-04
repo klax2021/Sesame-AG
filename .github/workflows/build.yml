@@ -2,8 +2,8 @@ name: Build Signed APK
 on:
   push:
     tags:
-      - '*'
-  workflow_dispatch:
+      - '*'       # 上游同步新TAG自动触发打包（全自动）
+  workflow_dispatch: # 手动只能选main启动脚本
 
 jobs:
   build:
@@ -11,18 +11,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0 # 拉取全部标签
 
       - name: 1. 自动切换源码
         run: |
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             TAG=${GITHUB_REF#refs/tags/}
-            echo "APP_VER=${TAG#*-}" >> $GITHUB_ENV
+            echo "APP_VER=${TAG}" >> $GITHUB_ENV
           else
-            LATEST_TAG=$(git tag | sort -t'-' -k1 -n | tail -1)
+            # 修正手动触发时的兜底逻辑，改用 Git 原生语义化版本排序
+            LATEST_TAG=$(git tag --sort=-v:refname | head -n 1)
             if [ -n "$LATEST_TAG" ]; then
               git checkout $LATEST_TAG
-              echo "APP_VER=${LATEST_TAG#*-}" >> $GITHUB_ENV
+              echo "APP_VER=${LATEST_TAG}" >> $GITHUB_ENV
             else
               echo "APP_VER=dev" >> $GITHUB_ENV
             fi
@@ -34,16 +35,22 @@ jobs:
           java-version: '17'
           distribution: temurin
 
-      - name: 2. 动态注入签名与架构
+      - name: 2. 屏蔽免责弹窗（保留实例化，仅剥离 show 规避闪退）
+        run: |
+          TARGET_MAIN=$(find app/src -name "MainActivity.kt")
+          if [ -n "$TARGET_MAIN" ]; then
+            echo "找到目标文件: $TARGET_MAIN"
+            # 使用扩展正则，完美兼容无参/有参的 DisclaimerDialog 转换
+            sed -i -E 's/(DisclaimerDialog\(.*\))\.show\(\)/\1/' "$TARGET_MAIN"
+          else
+            echo "未找到 MainActivity.kt，跳过此步骤"
+          fi
+
+      - name: 3. 动态注入个人签名（完全放权，沿用官方原生架构与混淆配置）
         run: |
           cat << 'EOF' >> app/build.gradle.kts
+
           android {
-              defaultConfig {
-                  ndk {
-                      abiFilters.clear()
-                      abiFilters.add("arm64-v8a")
-                  }
-              }
               if (System.getenv("KEYSTORE_PASSWORD") != null) {
                   signingConfigs {
                       maybeCreate("customRelease").apply {
@@ -62,38 +69,30 @@ jobs:
           }
           EOF
 
-      - name: 3. 解码签名
+      - name: 4. Decode Keystore
         env:
           KEYSTORE: ${{ secrets.KEYSTORE }}
         run: echo -n "$KEYSTORE" | base64 -d > app/mykey.jks
 
-      - name: 4. 赋权
+      - name: 5. Make gradlew executable
         run: chmod +x gradlew
 
-      # ==============================
-      # 最终正确弹窗屏蔽
-      # ==============================
-      - name: 屏蔽免责弹窗（官方源码匹配 · 绝不闪退）
-        run: |
-          FILE=app/src/main/java/com/sesame/ag/ui/activity/MainActivity.kt
-          sed -i 's/DisclaimerDialog().show(supportFragmentManager)/\/\/ &/' "$FILE"
-
-      - name: 5. 构建
+      - name: 6. Build Release APK
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: ./gradlew assembleRelease
 
-      - name: 6. 重命名
-        env:
-          VER: ${{ env.APP_VER }}
+      - name: 7. 精准收集官方标准 APK（剔除 unaligned 损坏件，拒绝 head -1 盲盒）
         run: |
-          SRC_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -1)
-          mv "$SRC_APK" "./Sesame-AG-arm64-v8a-${VER}-signed.apk"
+          mkdir -p ./out_apks
+          # 过滤掉编译中产生的 unaligned 未对齐半成品，只把真正的最终 Release 成品安全复制出来
+          find app/build/outputs/apk/release -name "*.apk" ! -name "*unaligned*" -exec cp {} ./out_apks/ \;
+          ls -l ./out_apks/
 
-      - name: 7. 上传
+      - name: 8. 上传全部有效打包产物
         uses: actions/upload-artifact@v4
         with:
-          name: Signed-APK
-          path: Sesame-AG-arm64-v8a-${{ env.APP_VER }}-signed.apk
+          name: Sesame-AG-${{ env.APP_VER }}-Signed-APKs
+          path: ./out_apks/
