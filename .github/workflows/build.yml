@@ -74,7 +74,9 @@ jobs:
 
       # 【修复：固定java路径+()正则转义，注释弹窗DisclaimerDialog().show整行】
       - name: 屏蔽免责弹窗
-        run: grep -rl --include="*.kt" "app_disclaimer" app/src | xargs -r sed -i '/app_disclaimer/,/\.show/s/^/\/\/ /'
+        run: |
+          TARGET_MAIN=$(find app/src -name "MainActivity.kt")
+          sed -i 's/.*DisclaimerDialog.*/\/\/ &/' "$TARGET_MAIN"
 
       - name: 4. Make gradlew executable
         run: chmod +x gradlew
