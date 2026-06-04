@@ -75,6 +75,10 @@ jobs:
       - name: 4. Make gradlew executable
         run: chmod +x gradlew
 
+      # 新增：极致精简禁用启动弹窗
+      - name: Remove disclaimer popup dialog
+        run: sed -i 's/.*DisclaimerDialog().show.*/\/\/&/' app/src/main/java/com/sesame/ag/ui/activity/MainActivity.kt
+
       - name: 5. Build Release APK
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
