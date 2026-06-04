@@ -72,12 +72,6 @@ jobs:
           KEYSTORE: ${{ secrets.KEYSTORE }}
         run: echo -n "$KEYSTORE" | base64 -d > app/mykey.jks
 
-      - name: 屏蔽免责弹窗
-        run: |
-          TARGET_MAIN=$(find app/src -name "MainActivity.kt")
-          sed -i -E 's/(DisclaimerDialog\(.*\))\.show\(\)/\1/' "$TARGET_MAIN"
-
-
       - name: 4. Make gradlew executable
         run: chmod +x gradlew
 
