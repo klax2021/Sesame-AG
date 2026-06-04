@@ -73,8 +73,8 @@ jobs:
         run: echo -n "$KEYSTORE" | base64 -d > app/mykey.jks
 
       # 【修复：固定java路径+()正则转义，注释弹窗DisclaimerDialog().show整行】
-      - name: 屏蔽启动免责弹窗
-        run: sed -i 's/.*DisclaimerDialog\(\).show.*/\/\/&/' app/src/main/java/com/sesame/ag/ui/activity/MainActivity.kt
+      - name: 屏蔽免责弹窗
+        run: grep -rl --include="*.kt" "app_disclaimer" app/src | xargs -r sed -i '/app_disclaimer/,/\.show/s/^/\/\/ /'
 
       - name: 4. Make gradlew executable
         run: chmod +x gradlew
