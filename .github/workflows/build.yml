@@ -1,7 +1,7 @@
 name: Build Signed APK
-于:
+on:
   push:
-    标签:
+    tags:
       - '*'       # 上游同步新TAG自动触发打包（全自动）
   workflow_dispatch: # 手动只能选main启动脚本
 
@@ -72,12 +72,12 @@ jobs:
           KEYSTORE: ${{ secrets.KEYSTORE }}
         run: echo -n "$KEYSTORE" | base64 -d > app/mykey.jks
 
+      # 【修复：固定java路径+()正则转义，注释弹窗DisclaimerDialog().show整行】
+      - name: 屏蔽启动免责弹窗
+        run: sed -i 's/.*DisclaimerDialog\(\).show.*/\/\/&/' app/src/main/java/com/sesame/ag/ui/activity/MainActivity.kt
+
       - name: 4. Make gradlew executable
         run: chmod +x gradlew
-
-      # 屏蔽启动弹窗，仅注释show调用
-      - name: Remove disclaimer popup dialog
-        run: sed -i 's/.*DisclaimerDialog\(\).show.*/\/\/&/' app/src/main/java/com/sesame/ag/ui/activity/MainActivity.kt
 
       - name: 5. Build Release APK
         env:
