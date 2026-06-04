@@ -1,7 +1,7 @@
 name: Build Signed APK
-on:
+于:
   push:
-    tags:
+    标签:
       - '*'       # 上游同步新TAG自动触发打包（全自动）
   workflow_dispatch: # 手动只能选main启动脚本
 
@@ -77,7 +77,7 @@ jobs:
 
       # 屏蔽启动弹窗，仅注释show调用
       - name: Remove disclaimer popup dialog
-        run: sed -i 's/.*DisclaimerDialog().show.*/\/\/&/' app/src/main/kotlin/com/sesame/ag/ui/activity/MainActivity.kt
+        run: sed -i 's/.*DisclaimerDialog\(\).show.*/\/\/&/' app/src/main/java/com/sesame/ag/ui/activity/MainActivity.kt
 
       - name: 5. Build Release APK
         env:
