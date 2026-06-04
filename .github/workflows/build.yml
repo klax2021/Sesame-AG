@@ -83,25 +83,14 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: ./gradlew assembleRelease
 
-      - name: 7. 精准提取 arm64-v8a 并规范化重命名
+      - name: 7. 精准提取 arm64-v8a 并规范化命名
         run: |
           mkdir -p ./out_apks
-          
-          # 1. 精准定位官方生成的标准 v8a 成品（排除未对齐的中间件）
-          TARGET_APK=$(find app/build/outputs/apk/release -name "*arm64-v8a*.apk" ! -name "*unaligned*" | head -n 1)
-          
-          if [ -n "$TARGET_APK" ]; then
-            echo "成功找到目标 v8a APK: $TARGET_APK"
-            # 2. 复制并重命名为你指定的标准格式：Sesame-AG-版本号-Signed.apk
-            cp "$TARGET_APK" "./out_apks/Sesame-AG-${{ env.APP_VER }}-Signed.apk"
-          else
-            echo "错误：未找到符合条件的 arm64-v8a APK！" && exit 1
-          fi
-          
+          find app/build/outputs/apk/release -name "*arm64-v8a*.apk" ! -name "*unaligned*" -exec cp {} ./out_apks/Sesame-AG-arm64-v8a-${{ env.APP_VER }}-Signed.apk \;
           ls -l ./out_apks/
 
-      - name: 8. 上传有效打包产物（保持默认的 ZIP 压缩包命名规则）
+      - name: 8. 上传有效打包产物
         uses: actions/upload-artifact@v4
         with:
-          name: Sesame-AG-${{ env.APP_VER }}-Signed-APKs
+          name: Sesame-AG-${{ env.APP_VER }}
           path: ./out_apks/
