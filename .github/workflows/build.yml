@@ -2,8 +2,8 @@ name: Build Signed APK
 on:
   push:
     tags:
-      - '*'       # 上游同步新TAG自动触发打包（全自动）
-  workflow_dispatch: # 手动只能选main启动脚本
+      - '*'
+  workflow_dispatch:
 
 jobs:
   build:
@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # 拉取全部标签，用来筛选最新TAG
+          fetch-depth: 0
 
       - name: 1. 自动切换源码
         run: |
@@ -34,20 +34,16 @@ jobs:
           java-version: '17'
           distribution: temurin
 
-      - name: 2. 动态注入个人签名与架构精简配置（顺应原厂优化版）
+      - name: 2. 动态注入签名与架构
         run: |
-          # 仅追加架构过滤与签名，不再强行干涉 isMinifyEnabled，直接沿用作者的 12M 混淆优化方案
           cat << 'EOF' >> app/build.gradle.kts
-
           android {
               defaultConfig {
                   ndk {
-                      // 依然强行只保留 arm64-v8a 架构
                       abiFilters.clear()
                       abiFilters.add("arm64-v8a")
                   }
               }
-              
               if (System.getenv("KEYSTORE_PASSWORD") != null) {
                   signingConfigs {
                       maybeCreate("customRelease").apply {
@@ -59,7 +55,6 @@ jobs:
                   }
                   buildTypes {
                       getByName("release") {
-                          // 仅注入签名，混淆开关完全交给作者源码控制
                           signingConfig = signingConfigs.getByName("customRelease")
                       }
                   }
@@ -67,29 +62,37 @@ jobs:
           }
           EOF
 
-      - name: 3. Decode Keystore
+      - name: 3. 解码签名
         env:
           KEYSTORE: ${{ secrets.KEYSTORE }}
         run: echo -n "$KEYSTORE" | base64 -d > app/mykey.jks
 
-      - name: 4. Make gradlew executable
+      - name: 4. 赋权
         run: chmod +x gradlew
 
-      - name: 5. Build Release APK
+      # ==============================
+      # 最终正确弹窗屏蔽
+      # ==============================
+      - name: 屏蔽免责弹窗（官方源码匹配 · 绝不闪退）
+        run: |
+          FILE=app/src/main/java/com/sesame/ag/ui/activity/MainActivity.kt
+          sed -i 's/DisclaimerDialog().show(supportFragmentManager)/\/\/ &/' "$FILE"
+
+      - name: 5. 构建
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: ./gradlew assembleRelease
 
-      - name: 6. Rename APK(only arm64-v8a)
+      - name: 6. 重命名
         env:
           VER: ${{ env.APP_VER }}
         run: |
           SRC_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -1)
           mv "$SRC_APK" "./Sesame-AG-arm64-v8a-${VER}-signed.apk"
 
-      - name: 7. Upload APK
+      - name: 7. 上传
         uses: actions/upload-artifact@v4
         with:
           name: Signed-APK
