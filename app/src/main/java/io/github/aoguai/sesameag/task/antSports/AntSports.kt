@@ -37,9 +37,13 @@ import io.github.aoguai.sesameag.task.common.TaskFlowPhase
 import io.github.aoguai.sesameag.task.common.TaskFlowSnapshot
 import io.github.aoguai.sesameag.task.common.TaskRpcFailureType
 import io.github.aoguai.sesameag.task.exchange.ExchangeCost
+import io.github.aoguai.sesameag.task.exchange.ExchangeEffectCatalog
+import io.github.aoguai.sesameag.task.exchange.ExchangeEffectNeed
 import io.github.aoguai.sesameag.task.exchange.ExchangeItem
 import io.github.aoguai.sesameag.task.exchange.ExchangeLimit
+import io.github.aoguai.sesameag.task.exchange.ExchangeReplenishResult
 import io.github.aoguai.sesameag.task.exchange.ExchangeSafety
+import io.github.aoguai.sesameag.task.exchange.ExchangeSafetyRules
 import io.github.aoguai.sesameag.util.*
 import io.github.aoguai.sesameag.util.FriendGuard
 import io.github.aoguai.sesameag.util.friend.FriendCapabilityRecorder
@@ -450,7 +454,8 @@ class AntSports : ModelTask() {
                 LinkedHashSet<String?>()
             ) {
                 refreshSportsEnergyExchangeOptionsForSettings()
-                SportsEnergyExchange.getList()
+                    .map { it.item.toMapperEntity() }
+                    .ifEmpty { SportsEnergyExchange.getList() }
             }.withDesc("勾选允许处理的运动能量兑换项，需开启“运动 | 能量兑换”。").also { sportsEnergyExchangeList = it }
         )
 
@@ -812,7 +817,59 @@ class AntSports : ModelTask() {
         refreshSportsEnergyExchangeOptionsForSettings()
     }
 
-    private fun exchangeSportsEnergyCandidate(candidate: SportsEnergyExchangeCandidate) {
+    internal fun replenishExchangeByNeed(
+        need: ExchangeEffectNeed,
+        reason: String,
+        maxCount: Int
+    ): ExchangeReplenishResult {
+        if (sportsEnergyExchange.value != true) {
+            return ExchangeReplenishResult.NOT_SELECTED
+        }
+        val selectedIds = sportsEnergyExchangeList.value
+            ?.filterNotNull()
+            ?.map { it.trim() }
+            ?.filter { it.isNotEmpty() }
+            ?.toSet()
+            ?: emptySet()
+        if (selectedIds.isEmpty()) {
+            return ExchangeReplenishResult.NOT_SELECTED
+        }
+        return runCatching {
+            val candidates = refreshSportsEnergyExchangeOptionsForSettings()
+            var matchedSelected = false
+            var attempted = false
+            var exchangedCount = 0
+            for (candidate in candidates.sortedBy { ExchangeEffectCatalog.priorityFor(it.item, need) }) {
+                if (exchangedCount >= maxCount.coerceAtLeast(1)) {
+                    break
+                }
+                if (!selectedIds.contains(candidate.item.id) ||
+                    candidate.item.effectTags.none { it.need == need }
+                ) {
+                    continue
+                }
+                matchedSelected = true
+                if (candidate.item.safety != ExchangeSafety.AUTO) {
+                    continue
+                }
+                attempted = true
+                if (exchangeSportsEnergyCandidate(candidate)) {
+                    exchangedCount += 1
+                    Log.sports("运动能量缺货补兑🎁[${candidate.item.name}]#${reason.ifBlank { need.name }}")
+                }
+            }
+            when {
+                exchangedCount > 0 -> ExchangeReplenishResult.EXCHANGED
+                matchedSelected && attempted -> ExchangeReplenishResult.BUSINESS_LIMIT
+                matchedSelected -> ExchangeReplenishResult.NOT_AVAILABLE
+                else -> ExchangeReplenishResult.NOT_SELECTED
+            }
+        }.onFailure {
+            Log.printStackTrace(TAG, "replenishSportsExchangeByNeed err:", it)
+        }.getOrDefault(ExchangeReplenishResult.RETRY_LATER)
+    }
+
+    private fun exchangeSportsEnergyCandidate(candidate: SportsEnergyExchangeCandidate): Boolean {
         runCatching {
             AntSportsRpcCall.NeverlandRpcCall.deliverSportsItemMallPage("@alipay/health-island/goodsDetail")
         }.onFailure {
@@ -826,15 +883,17 @@ class AntSports : ModelTask() {
                 cityCode = candidate.cityCode
             )
         )
-        if (!ResChecker.checkRes(TAG, "运动能量兑换详情查询失败:", detailResp)) {
+        if (!ExchangeSafetyRules.isSuccessResponse(detailResp) &&
+            !ResChecker.checkRes(TAG, "运动能量兑换详情查询失败:", detailResp)
+        ) {
             Log.sports("运动能量兑换🎁兑换前详情校验失败[${candidate.item.name}]")
-            return
+            return false
         }
         val detail = extractSportsItemMallData(detailResp).optJSONObject("itemDetailVO")
         val verifiedCandidate = detail?.let { buildSportsEnergyExchangeCandidate(it) } ?: candidate
         if (verifiedCandidate.item.safety != ExchangeSafety.AUTO) {
             Log.sports("运动能量兑换🎁跳过[${verifiedCandidate.item.displayName()}]#${verifiedCandidate.item.safetyReason}")
-            return
+            return false
         }
         val orderResp = JSONObject(
             AntSportsRpcCall.NeverlandRpcCall.createOrder(
@@ -843,7 +902,9 @@ class AntSports : ModelTask() {
                 cityCode = verifiedCandidate.cityCode
             )
         )
-        if (ResChecker.checkRes(TAG, "运动能量兑换下单失败:", orderResp)) {
+        if (ExchangeSafetyRules.isSuccessResponse(orderResp) ||
+            ResChecker.checkRes(TAG, "运动能量兑换下单失败:", orderResp)
+        ) {
             val purchaseType = extractSportsItemMallData(orderResp).optString("purchaseType").ifBlank { "purePoint" }
             Log.sports("运动能量兑换🎁兑换[${verifiedCandidate.item.name}]#$purchaseType")
             runCatching {
@@ -851,9 +912,21 @@ class AntSports : ModelTask() {
             }.onFailure {
                 Log.printStackTrace(TAG, "exchangeSportsEnergyCandidate.collectData err:", it)
             }
+            runCatching {
+                AntSportsRpcCall.NeverlandRpcCall.queryItemDetail(
+                    benefitId = verifiedCandidate.benefitId,
+                    itemId = verifiedCandidate.itemId,
+                    materialType = verifiedCandidate.materialType,
+                    cityCode = verifiedCandidate.cityCode
+                )
+            }.onFailure {
+                Log.printStackTrace(TAG, "exchangeSportsEnergyCandidate.postDetail err:", it)
+            }
+            return true
         } else {
             Log.sports("运动能量兑换🎁兑换失败[${verifiedCandidate.item.name}]#$orderResp")
         }
+        return false
     }
 
     private fun querySportsExchangeNeedEnergyValue(source: String): String {
@@ -921,6 +994,7 @@ class AntSports : ModelTask() {
             manualMaterial || manualSpecialType || orderLike -> "商品/下单链路需手动处理"
             else -> ""
         }
+        val effectTags = ExchangeEffectCatalog.tagsFor(ExchangeEffectCatalog.SOURCE_SPORTS_ENERGY, name)
         return SportsEnergyExchangeCandidate(
             ExchangeItem(
                 id = stableId,
@@ -935,7 +1009,15 @@ class AntSports : ModelTask() {
                     statusText = listOf(status, tagText).filter { it.isNotBlank() }.joinToString("、")
                 ),
                 safety = safety,
-                safetyReason = safetyReason
+                safetyReason = safetyReason,
+                effectTags = effectTags,
+                displayMeta = ExchangeEffectCatalog.displayMeta(
+                    ExchangeEffectCatalog.SOURCE_SPORTS_ENERGY,
+                    name,
+                    safety,
+                    safetyReason,
+                    effectTags
+                )
             ),
             benefitId = benefitId,
             itemId = itemId,

@@ -12,7 +12,9 @@ import io.github.aoguai.sesameag.hook.keepalive.PersistentScheduleState
 import io.github.aoguai.sesameag.hook.keepalive.ScheduledTaskRouter
 import io.github.aoguai.sesameag.model.Model
 import io.github.aoguai.sesameag.task.antFarm.AntFarm
+import io.github.aoguai.sesameag.task.antForest.AntForest
 import io.github.aoguai.sesameag.task.antMember.AntMember
+import io.github.aoguai.sesameag.task.antSesameCredit.AntSesameCredit
 import io.github.aoguai.sesameag.task.antSports.AntSports
 import io.github.aoguai.sesameag.task.customTasks.CustomTask
 import io.github.aoguai.sesameag.task.customTasks.ManualTask
@@ -478,6 +480,16 @@ internal object ApplicationBroadcastDispatcher {
                 ExchangeOptionsRefreshBridge.TARGET_SPORTS_ENERGY -> {
                     Model.getModel(AntSports::class.java)?.refreshSportsEnergyExchangeOptionsForRemote()
                         ?: return ExchangeOptionsRefreshResult(false, "运动模块未初始化", currentUserId)
+                }
+
+                ExchangeOptionsRefreshBridge.TARGET_FOREST_VITALITY -> {
+                    Model.getModel(AntForest::class.java)?.refreshVitalityExchangeOptionsForRemote()
+                        ?: return ExchangeOptionsRefreshResult(false, "森林模块未初始化", currentUserId)
+                }
+
+                ExchangeOptionsRefreshBridge.TARGET_SESAME_GRAIN -> {
+                    Model.getModel(AntSesameCredit::class.java)?.refreshSesameGrainExchangeOptionsForRemote()
+                        ?: return ExchangeOptionsRefreshResult(false, "芝麻信用模块未初始化", currentUserId)
                 }
 
                 else -> return ExchangeOptionsRefreshResult(false, "未知兑换列表刷新目标: $target", currentUserId)
