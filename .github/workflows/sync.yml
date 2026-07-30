@@ -3,21 +3,27 @@ on:
   schedule:
     - cron: '0 3 * * 1'
   workflow_dispatch:
-
 jobs:
   sync:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write   # 删除历史 Run 需要这个权限
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ secrets.UPSTREAM_PAT }}
-
       - run: |
           git config --global user.name "bot"
           git config --global user.email "bot@github.com"
           git remote add upstream https://github.com/Sesame-AG/Sesame-AG.git || true
           git fetch upstream --tags
           git push origin --tags
+      - name: Clean Old Sync Runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          retain_days: 0
+          keep_minimum_runs: 3
