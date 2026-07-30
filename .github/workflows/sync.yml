@@ -1,25 +1,62 @@
 name: Sync Upstream Tags Automatically
+
 on:
   schedule:
+    # 每周一 UTC 03:00 (北京时间 11:00) 自动检查一次
     - cron: '0 3 * * 1'
+  # 保留手动触发按钮
   workflow_dispatch:
+
 jobs:
   sync:
+    name: Sync Tags from Upstream
     runs-on: ubuntu-latest
     permissions:
       contents: write
       actions: write   # 删除历史 Run 需要这个权限
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # 必须使用 PAT，推送的 Tag 才能成功触发 Build 工作流
           token: ${{ secrets.UPSTREAM_PAT }}
-      - run: |
+
+      - name: Detect New Upstream Tags
+        run: |
           git config --global user.name "bot"
           git config --global user.email "bot@github.com"
+
+          # 添加上游仓库并拉取最新 Tags
           git remote add upstream https://github.com/Sesame-AG/Sesame-AG.git || true
           git fetch upstream --tags
+
+          # 探测（Dry-run）：是否存在新 Tag，结果写入环境变量供后续步骤使用
+          if git push origin --tags --dry-run 2>&1 | grep -q "\[new tag\]"; then
+            echo "HAS_NEW_TAG=true" >> $GITHUB_ENV
+            echo "🎉 发现上游有新 Tag！"
+          else
+            echo "HAS_NEW_TAG=false" >> $GITHUB_ENV
+            echo "☕ 上游没有新 Tag，无变动。"
+          fi
+
+      - name: Push New Tags
+        if: env.HAS_NEW_TAG == 'true'
+        run: |
           git push origin --tags
+          echo "✅ 推送成功。"
+
+      - name: Trigger Build Workflow
+        if: env.HAS_NEW_TAG == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_PAT }}
+        run: |
+          gh workflow run "Build Signed APK" --repo ${{ github.repository }}
+          echo "🚀 已触发 Build Signed APK 打包任务。"
+
+      # 无论本次有没有新 Tag，都照常清理一次历史记录，保持仓库整洁
+      # 用 delete_workflow_pattern 限定只清理本工作流自己，不影响 Build 等其他工作流的记录，所以视情况添加
       - name: Clean Old Sync Runs
         uses: Mattraks/delete-workflow-runs@v2
         with:
