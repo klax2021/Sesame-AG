@@ -1,13 +1,17 @@
 name: Build Signed APK
+# 加 run-name，Actions 运行列表里会优雅地显示为 Build Signed APK - 4191-0.1.8
+run-name: Build Signed APK - ${{ github.ref_name }}
+
 on:
   push:
     tags:
-      - '*'       # 上游同步新TAG自动触发打包（全自动）
-  workflow_dispatch: # 手动只能选main启动脚本
+      - '*'       # 上游同步新 TAG 自动触发打包（全自动）
+  workflow_dispatch: # 手动触发（默认在 main 分支，脚本内部会自动切换到最新 Tag）
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -29,7 +33,7 @@ jobs:
             fi
           fi
 
-      - name: 预配置Java
+      - name: 预配置 Java
         uses: actions/setup-java@v4
         with:
           java-version: '17'
@@ -94,3 +98,4 @@ jobs:
         with:
           name: Sesame-AG-${{ env.APP_VER }}
           path: ./out_apks/
+          retention-days: 7 # 设置产物在 Actions 保留 7 天
